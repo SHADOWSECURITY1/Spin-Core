@@ -51,23 +51,16 @@ registry, device-key proofs and the key provider follow in later versions.
 
 ## Install
 
-Pinned to a tag, as a git dependency:
+Pinned to a commit (or a tag, once one exists), as a git dependency:
 
 ```json
 "dependencies": {
-  "@spin/core": "github:SHADOWSECURITY1/Spin-Core#v0.1.0"
+  "@spin/core": "github:SHADOWSECURITY1/Spin-Core#1723746f2631c3dec296b37da11380124ef17f90"
 }
 ```
 
-The repo is private, so npm needs GitHub read access where it installs. On
-Replit, add a secret holding a fine-grained token with read-only *Contents*
-access to this repo, and point git at it once:
-
-```sh
-git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
-```
-
-npm runs `prepare` on install, which builds `dist/`.
+The repo is public, so no token is needed. npm runs `prepare` on install,
+which builds `dist/`. Upgrade by changing the pinned commit.
 
 ## Using it
 
