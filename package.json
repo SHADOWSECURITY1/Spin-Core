@@ -1,6 +1,6 @@
 {
   "name": "@spin/core",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Shared SPIN security core: the Pay Envelope, and SPIN Vault's zero-knowledge file and post-quantum messaging crypto.",
   "private": true,
   "license": "UNLICENSED",
@@ -11,17 +11,21 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./vault": {
       "types": "./dist/vault/index.d.ts",
       "react-native": "./dist/vault/index.js",
-      "import": "./dist/vault/index.js"
+      "import": "./dist/vault/index.js",
+      "default": "./dist/vault/index.js"
     },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
-      "import": "./dist/testing/index.js"
-    }
+      "import": "./dist/testing/index.js",
+      "default": "./dist/testing/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
@@ -32,7 +36,7 @@
     "build": "tsc -p tsconfig.build.json",
     "prepare": "npm run build",
     "check": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts && npm run build && node test/packaging.check.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.19.0",
@@ -45,5 +49,7 @@
     "@noble/hashes": "^2.4.0",
     "@noble/post-quantum": "^0.6.1"
   },
-  "sideEffects": false
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts"
 }
