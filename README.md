@@ -5,8 +5,9 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
 
 - **Pay Envelope** (v0.1): single-use, short-lived, context-bound payment
   credentials. `import … from "@spin/core"` (Node).
-- **Vault crypto** (v0.2): SPIN Vault's zero-knowledge files and hybrid
-  post-quantum messaging, one implementation for web, Node and React Native.
+- **Vault crypto** (v0.2–0.3): SPIN Vault's zero-knowledge files, hybrid
+  post-quantum messaging and forward-secret messaging, one implementation for
+  web, Node and React Native.
   `import … from "@spin/core/vault"`.
 
 ## What's in v0.1
@@ -63,6 +64,14 @@ the package root contains Node-only code.
 | Files | `encryptFile` / `decryptFile` / `rewrapFileDek`: per-file random AES-256-GCM DEK, sealed with the master key. |
 | Identity | `generateX25519Identity`, `generateKyberKeyPair` + `wrapKyberSecretKey`, unwrap and rewrap (password change). |
 | Messages | `encryptMessage` / `decryptMessage`: hybrid X25519 + ML-KEM-768. The DEK's wrapping key is HKDF of **both** shared secrets, so breaking one KEM isn't enough. |
+| Forward secrecy | `ensurePrekeyPool` / `sendMessage` / `decryptIncoming` over an app-supplied `FsTransport`; underneath, a PQXDH-style handshake (3 × X25519 + 2 × ML-KEM-768 with one-time prekeys) into a symmetric-key ratchet. Read messages expire as the chain moves on. Session state is sealed with the master key for server storage. |
+
+**Forward secrecy, known limits (v1, unchanged):** no DH ratchet, so no
+post-compromise security; out-of-order messages behind the chain are
+unreadable; the responder doesn't check the handshake's initiator identity
+against the sender's known key; and if both sides open a session at the same
+moment, each keeps its own and the other's first messages read as
+`[expired]`.
 
 **Wire format: unchanged.** Field names and encodings are exactly what SPIN
 Vault web and mobile already store. `test/fixtures/` holds payloads produced
@@ -183,6 +192,6 @@ npm run build   # dist/
 
 1. **v0.1:** Pay Envelope
 2. **v0.2:** Vault and messaging crypto (this release)
-3. Forward-secrecy ratchet (so mobile can read ratcheted messages)
+3. **v0.3:** Forward-secret messaging (ratchet + orchestration), shared by web and mobile
 4. Post-quantum suite registry, crypto inventory, device-key proofs
 5. One key-provider interface (env today, KMS/HSM later)

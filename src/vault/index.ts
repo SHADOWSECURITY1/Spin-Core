@@ -11,3 +11,5 @@ export * from './master-key.js';
 export * from './files.js';
 export * from './identity.js';
 export * from './messages.js';
+export * from './ratchet.js';
+export * from './fs-messaging.js';
