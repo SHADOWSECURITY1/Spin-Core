@@ -69,10 +69,17 @@ Vault web and mobile already store. `test/fixtures/` holds payloads produced
 by the real pre-`@spin/core` web and mobile code; the tests must keep opening
 them. Changing the format means a new version label, not editing v1.
 
-**React Native:** Hermes has no `crypto.getRandomValues`. Load a polyfill
-before any SPIN crypto (`import 'react-native-get-random-values'` first in
-`index.js`). Without one, `@spin/core/vault` throws rather than use a weak
-random source. Bundlers without package `exports` support resolve
+**React Native:** Hermes has no `crypto.getRandomValues`, and older Hermes
+versions lack `TextEncoder`/`TextDecoder`. Load polyfills first in `index.js`:
+
+```js
+import 'react-native-get-random-values';
+import 'fast-text-encoding';
+```
+
+Without a random source, `@spin/core/vault` throws rather than use a weak one.
+`@spin/core`'s own code does its UTF-8 in plain JavaScript, but `@noble/curves`
+2.x calls `TextEncoder` while loading. Bundlers without package `exports` support resolve
 `@spin/core/vault` through `vault/package.json`.
 
 ## Install

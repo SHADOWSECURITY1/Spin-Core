@@ -61,5 +61,64 @@ export function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
-export const utf8Encode = (s: string): Uint8Array => new TextEncoder().encode(s);
-export const utf8Decode = (b: Uint8Array): string => new TextDecoder().decode(b);
+/*
+ * UTF-8 without TextEncoder/TextDecoder: Hermes (React Native <= 0.73) has
+ * neither. Behaves exactly like them (WHATWG Encoding): lone surrogates encode
+ * as U+FFFD; invalid byte sequences decode as U+FFFD per maximal subpart; a
+ * leading byte-order mark is stripped on decode. Tested against Node's
+ * implementations.
+ */
+export function utf8Encode(s: string): Uint8Array {
+  const out: number[] = [];
+  for (let i = 0; i < s.length; i++) {
+    let c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) {
+        c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00);
+        i++;
+      } else c = 0xfffd;
+    } else if (c >= 0xd800 && c <= 0xdfff) c = 0xfffd;
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return Uint8Array.from(out);
+}
+
+export function utf8Decode(bytes: Uint8Array): string {
+  const cps: number[] = [];
+  let cp = 0, needed = 0, seen = 0, lower = 0x80, upper = 0xbf;
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i]!;
+    if (needed === 0) {
+      if (b <= 0x7f) cps.push(b);
+      else if (b >= 0xc2 && b <= 0xdf) { needed = 1; cp = b & 0x1f; }
+      else if (b >= 0xe0 && b <= 0xef) {
+        if (b === 0xe0) lower = 0xa0;
+        if (b === 0xed) upper = 0x9f;
+        needed = 2; cp = b & 0xf;
+      } else if (b >= 0xf0 && b <= 0xf4) {
+        if (b === 0xf0) lower = 0x90;
+        if (b === 0xf4) upper = 0x8f;
+        needed = 3; cp = b & 0x7;
+      } else cps.push(0xfffd);
+      continue;
+    }
+    if (b < lower || b > upper) {
+      cp = needed = seen = 0; lower = 0x80; upper = 0xbf;
+      cps.push(0xfffd);
+      i--; // reprocess this byte as the start of a new sequence
+      continue;
+    }
+    lower = 0x80; upper = 0xbf;
+    cp = (cp << 6) | (b & 0x3f);
+    if (++seen === needed) { cps.push(cp); cp = needed = seen = 0; }
+  }
+  if (needed !== 0) cps.push(0xfffd);
+  let start = cps[0] === 0xfeff ? 1 : 0;
+  let out = '';
+  for (; start < cps.length; start += 8192) out += String.fromCodePoint(...cps.slice(start, start + 8192));
+  return out;
+}
