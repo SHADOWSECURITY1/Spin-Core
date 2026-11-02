@@ -3,9 +3,11 @@
 The shared SPIN security core. One implementation of the security-critical
 logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
 
-**v0.1** ships the **Pay Envelope**: single-use, short-lived, context-bound
-payment credentials. Vault and messaging crypto, the post-quantum suite
-registry, device-key proofs and the key provider follow in later versions.
+- **Pay Envelope** (v0.1): single-use, short-lived, context-bound payment
+  credentials. `import … from "@spin/core"` (Node).
+- **Vault crypto** (v0.2): SPIN Vault's zero-knowledge files and hybrid
+  post-quantum messaging, one implementation for web, Node and React Native.
+  `import … from "@spin/core/vault"`.
 
 ## What's in v0.1
 
@@ -49,13 +51,37 @@ registry, device-key proofs and the key provider follow in later versions.
 | Amount tolerance: SPIN-Envelope stored ‰, SPIN-Vault ppm, floating-point compare | ppm everywhere, exact integer compare |
 | A new PAN could collide with an existing one | Regenerated until unused |
 
+## Vault crypto (`@spin/core/vault`)
+
+Zero-knowledge storage and messaging for SPIN Vault. No Node imports, so it
+bundles for browsers and React Native (Hermes). Always import the subpath:
+the package root contains Node-only code.
+
+| | |
+|---|---|
+| Master key | PBKDF2-SHA256, 210 000 iterations. `deriveWebCryptoMasterKey()` gives a **non-extractable** Web Crypto key (web); `deriveMasterKeyBytes()` + `rawMasterKey()` give raw bytes for the OS secure store (mobile). Same key material, interchangeable ciphertexts. |
+| Files | `encryptFile` / `decryptFile` / `rewrapFileDek`: per-file random AES-256-GCM DEK, sealed with the master key. |
+| Identity | `generateX25519Identity`, `generateKyberKeyPair` + `wrapKyberSecretKey`, unwrap and rewrap (password change). |
+| Messages | `encryptMessage` / `decryptMessage`: hybrid X25519 + ML-KEM-768. The DEK's wrapping key is HKDF of **both** shared secrets, so breaking one KEM isn't enough. |
+
+**Wire format: unchanged.** Field names and encodings are exactly what SPIN
+Vault web and mobile already store. `test/fixtures/` holds payloads produced
+by the real pre-`@spin/core` web and mobile code; the tests must keep opening
+them. Changing the format means a new version label, not editing v1.
+
+**React Native:** Hermes has no `crypto.getRandomValues`. Load a polyfill
+before any SPIN crypto (`import 'react-native-get-random-values'` first in
+`index.js`). Without one, `@spin/core/vault` throws rather than use a weak
+random source. Bundlers without package `exports` support resolve
+`@spin/core/vault` through `vault/package.json`.
+
 ## Install
 
 Pinned to a commit (or a tag, once one exists), as a git dependency:
 
 ```json
 "dependencies": {
-  "@spin/core": "github:SHADOWSECURITY1/Spin-Core#1723746f2631c3dec296b37da11380124ef17f90"
+  "@spin/core": "github:SHADOWSECURITY1/Spin-Core#<commit>"
 }
 ```
 
@@ -148,7 +174,8 @@ npm run build   # dist/
 
 ## Roadmap
 
-1. **v0.1:** Pay Envelope (this release)
-2. Vault and messaging crypto (web and mobile share one implementation)
-3. Post-quantum suite registry, crypto inventory, device-key proofs
-4. One key-provider interface (env today, KMS/HSM later)
+1. **v0.1:** Pay Envelope
+2. **v0.2:** Vault and messaging crypto (this release)
+3. Forward-secrecy ratchet (so mobile can read ratcheted messages)
+4. Post-quantum suite registry, crypto inventory, device-key proofs
+5. One key-provider interface (env today, KMS/HSM later)

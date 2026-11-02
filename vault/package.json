@@ -1,0 +1,6 @@
+{
+  "//": "Fallback for bundlers without package.json \"exports\" support (React Native Metro < 0.82 by default): lets `@spin/core/vault` resolve.",
+  "main": "../dist/vault/index.js",
+  "types": "../dist/vault/index.d.ts",
+  "sideEffects": false
+}

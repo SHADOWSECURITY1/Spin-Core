@@ -1,7 +1,7 @@
 {
   "name": "@spin/core",
-  "version": "0.1.0",
-  "description": "Shared SPIN security core: the Pay Envelope (single-use, context-bound payment credentials) and its storage contract.",
+  "version": "0.2.0",
+  "description": "Shared SPIN security core: the Pay Envelope, and SPIN Vault's zero-knowledge file and post-quantum messaging crypto.",
   "private": true,
   "license": "UNLICENSED",
   "type": "module",
@@ -13,6 +13,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./vault": {
+      "types": "./dist/vault/index.d.ts",
+      "react-native": "./dist/vault/index.js",
+      "import": "./dist/vault/index.js"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js"
@@ -20,7 +25,8 @@
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "vault"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -32,5 +38,12 @@
     "@types/node": "^20.19.0",
     "tsx": "^4.19.1",
     "typescript": "^5.6.3"
-  }
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.4.0",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
+    "@noble/post-quantum": "^0.6.1"
+  },
+  "sideEffects": false
 }
