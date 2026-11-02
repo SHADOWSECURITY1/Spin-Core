@@ -147,24 +147,41 @@ function toMinorUnits(value: string, currency: string): number | null {
   return Number(whole) * 10 ** digits + Number(frac.padEnd(digits, "0") || "0");
 }
 
-function verifyWebAuthn(si: SignedIntent, key: PayerKey, policy: WebAuthnPolicy | undefined): boolean {
-  if (!policy || !si.authenticatorData || !si.clientDataJSON) return false;
-  const clientDataBytes = b64u(si.clientDataJSON);
+/** A signature over a challenge, as a device produces it. */
+export interface KeyProof {
+  /** base64url. For webauthn-es256: the DER ECDSA signature from the assertion. */
+  signature: string;
+  /** webauthn-es256 only (base64url). */
+  authenticatorData?: string;
+  /** webauthn-es256 only (base64url). */
+  clientDataJSON?: string;
+}
+
+function verifyWebAuthn(
+  proof: KeyProof,
+  key: PayerKey,
+  challenge: Uint8Array,
+  policy: WebAuthnPolicy | undefined,
+  spcTotal: { amount: number; currency: string } | undefined,
+): boolean {
+  if (!policy || !proof.authenticatorData || !proof.clientDataJSON) return false;
+  const clientDataBytes = b64u(proof.clientDataJSON);
   const clientData = JSON.parse(Buffer.from(clientDataBytes).toString("utf8")) as Record<string, unknown>;
 
   if (clientData.type !== "webauthn.get" && clientData.type !== "payment.get") return false;
-  if (clientData.challenge !== Buffer.from(intentChallenge(si.intent)).toString("base64url")) return false;
+  if (clientData.challenge !== Buffer.from(challenge).toString("base64url")) return false;
   if (typeof clientData.origin !== "string" || !policy.origins.includes(clientData.origin)) return false;
 
-  // Secure Payment Confirmation: the browser itself showed the total, so it must be the intent's.
+  // Secure Payment Confirmation: the browser itself showed the total, so it must be the approved one.
   if (clientData.type === "payment.get") {
+    if (!spcTotal) return false;
     const payment = clientData.payment as { total?: { currency?: string; value?: string } } | undefined;
     const total = payment?.total;
-    if (!total || total.currency !== si.intent.currency) return false;
-    if (toMinorUnits(String(total.value), si.intent.currency) !== si.intent.amount) return false;
+    if (!total || total.currency !== spcTotal.currency) return false;
+    if (toMinorUnits(String(total.value), spcTotal.currency) !== spcTotal.amount) return false;
   }
 
-  const authData = b64u(si.authenticatorData);
+  const authData = b64u(proof.authenticatorData);
   if (authData.length < 37) return false;
   const rpIdHash = createHash("sha256").update(policy.rpId, "utf8").digest();
   if (!Buffer.from(authData.subarray(0, 32)).equals(rpIdHash)) return false;
@@ -178,7 +195,42 @@ function verifyWebAuthn(si: SignedIntent, key: PayerKey, policy: WebAuthnPolicy 
   signed.set(authData, 0);
   signed.set(clientDataHash, authData.length);
   // Authenticators may emit high-S signatures, so lowS is relaxed (as WebAuthn allows).
-  return p256.verify(b64u(si.signature), signed, b64u(key.publicKey), { format: "der", lowS: false });
+  return p256.verify(b64u(proof.signature), signed, b64u(key.publicKey), { format: "der", lowS: false });
+}
+
+/**
+ * True iff `proof` is `key`'s signature over the 32-byte `challenge`, under
+ * the key's scheme. Never throws. `spcTotal` is the amount a Secure Payment
+ * Confirmation prompt must have shown (omit it to refuse SPC assertions).
+ */
+export function verifyKeySignature(
+  key: PayerKey,
+  challenge: Uint8Array,
+  proof: KeyProof,
+  webauthn?: WebAuthnPolicy,
+  spcTotal?: { amount: number; currency: string },
+): boolean {
+  try {
+    if (typeof proof?.signature !== "string") return false;
+    switch (key.scheme) {
+      case "ed25519":
+        return verifyEd25519(key.publicKey, challenge, proof.signature);
+      case "hybrid-ed25519-mldsa65": {
+        const [edPub, pqPub] = key.publicKey.split(".");
+        const [edSig, pqSig] = proof.signature.split(".");
+        if (!edPub || !pqPub || !edSig || !pqSig) return false;
+        // AND: a forgery must break both Ed25519 and ML-DSA-65.
+        if (!verifyEd25519(edPub, challenge, edSig)) return false;
+        return ml_dsa65.verify(b64u(pqSig), challenge, b64u(pqPub));
+      }
+      case "webauthn-es256":
+        return verifyWebAuthn(proof, key, challenge, webauthn, spcTotal);
+      default:
+        return false;
+    }
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -190,26 +242,53 @@ function verifyWebAuthn(si: SignedIntent, key: PayerKey, policy: WebAuthnPolicy 
 export function verifySignedIntent(si: SignedIntent, key: PayerKey, webauthn?: WebAuthnPolicy): boolean {
   try {
     if (!isWellFormedIntent(si.intent) || si.intent.payerId !== key.payerId) return false;
-    const challenge = intentChallenge(si.intent);
-    switch (key.scheme) {
-      case "ed25519":
-        return verifyEd25519(key.publicKey, challenge, si.signature);
-      case "hybrid-ed25519-mldsa65": {
-        const [edPub, pqPub] = key.publicKey.split(".");
-        const [edSig, pqSig] = si.signature.split(".");
-        if (!edPub || !pqPub || !edSig || !pqSig) return false;
-        // AND: a forgery must break both Ed25519 and ML-DSA-65.
-        if (!verifyEd25519(edPub, challenge, edSig)) return false;
-        return ml_dsa65.verify(b64u(pqSig), challenge, b64u(pqPub));
-      }
-      case "webauthn-es256":
-        return verifyWebAuthn(si, key, webauthn);
-      default:
-        return false;
-    }
+    return verifyKeySignature(key, intentChallenge(si.intent), si, webauthn, {
+      amount: si.intent.amount,
+      currency: si.intent.currency,
+    });
   } catch {
     return false;
   }
+}
+
+// ── Adding a device to an existing customer ─────────────────────────────────
+
+/**
+ * What an existing device signs to approve enrolling a new one. Without this,
+ * anyone holding the integrator's API key could enroll their own device on a
+ * real customer and then sign approvals as them.
+ */
+export interface DeviceEnrollment {
+  v: 1;
+  payerId: string;
+  /** The key being added. */
+  newKey: { keyId: string; scheme: IntentScheme; publicKey: string };
+  /** ISO 8601; at most an hour ahead. */
+  expiresAt: string;
+  /** Single use (shares the payer's nonce space with intents). */
+  nonce: string;
+}
+
+const ENROLL_PREFIX = "spin/enroll-device/v1\n";
+
+export function enrollmentChallenge(e: DeviceEnrollment): Uint8Array {
+  const canonical = JSON.stringify([e.v, e.payerId, e.newKey.keyId, e.newKey.scheme, e.newKey.publicKey, e.expiresAt, e.nonce]);
+  return new Uint8Array(createHash("sha256").update(ENROLL_PREFIX + canonical, "utf8").digest());
+}
+
+export function isWellFormedEnrollment(e: unknown): e is DeviceEnrollment {
+  if (!e || typeof e !== "object") return false;
+  const x = e as Record<string, unknown>;
+  const k = x.newKey as Record<string, unknown> | undefined;
+  return (
+    x.v === 1 &&
+    typeof x.payerId === "string" && x.payerId.length > 0 &&
+    !!k && typeof k.keyId === "string" && k.keyId.length > 0 &&
+    (k.scheme === "ed25519" || k.scheme === "hybrid-ed25519-mldsa65" || k.scheme === "webauthn-es256") &&
+    typeof k.publicKey === "string" && k.publicKey.length > 0 &&
+    typeof x.expiresAt === "string" && !Number.isNaN(Date.parse(x.expiresAt)) &&
+    typeof x.nonce === "string" && x.nonce.length >= MIN_NONCE_LENGTH && x.nonce.length <= 128
+  );
 }
 
 const P256_SPKI_PREFIX = Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex");

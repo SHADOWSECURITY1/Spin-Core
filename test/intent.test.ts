@@ -176,3 +176,33 @@ for (const c of payerKeyStoreConformance({
 })) {
   test(`conformance (memory): ${c.name}`, c.run);
 }
+
+test("adding a device: an existing device's approval covers exactly that new key", async () => {
+  const { generateKeyPairSync: gen, sign: nodeSign } = await import("node:crypto");
+  const { enrollmentChallenge, verifyKeySignature } = await import("../src/index.js");
+  const existing = gen("ed25519");
+  const existingKey = {
+    payerId: "alice",
+    keyId: "phone-1",
+    scheme: "ed25519" as const,
+    publicKey: existing.publicKey.export({ type: "spki", format: "der" }).toString("base64url"),
+    revokedAt: null,
+  };
+  const newPasskey = passkeyDevice("alice", "laptop");
+  const enrollment = {
+    v: 1 as const,
+    payerId: "alice",
+    newKey: { keyId: "laptop", scheme: newPasskey.key.scheme, publicKey: newPasskey.key.publicKey },
+    expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+    nonce: "enroll-0123456789abcdef",
+  };
+  const sig = nodeSign(null, enrollmentChallenge(enrollment), existing.privateKey).toString("base64url");
+  assert.equal(verifyKeySignature(existingKey, enrollmentChallenge(enrollment), { signature: sig }), true);
+  // Swapping in the attacker's key invalidates the approval.
+  const attacker = ed25519Device("alice", "laptop");
+  const swapped = { ...enrollment, newKey: { ...enrollment.newKey, publicKey: attacker.key.publicKey } };
+  assert.equal(verifyKeySignature(existingKey, enrollmentChallenge(swapped), { signature: sig }), false);
+  // An intent signature can't be passed off as an enrollment approval (different domain).
+  const si = ed25519Device("alice").sign(intentFor("alice"));
+  assert.equal(verifyKeySignature(existingKey, enrollmentChallenge(enrollment), { signature: si.signature }), false);
+});

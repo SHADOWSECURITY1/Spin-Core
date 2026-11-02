@@ -35,6 +35,12 @@ payment.
    existing `deviceKeyProof` schemes in SPIN Pay (`ed25519`, or the
    post-quantum `hybrid-ed25519-mldsa65`). A customer can enroll several
    devices; synced passkeys survive a lost phone.
+
+   **Who may enroll.** The integrator enrolls a customer's *first* device (as
+   a bank onboards a customer). Every *later* device needs an approval signed
+   by one of the customer's existing devices, covering exactly the new key.
+   Otherwise a stolen integrator API key could enroll the attacker's phone on
+   a real customer and sign approvals as them.
 2. **Approve (each payment).** The device shows **"Pay $4.50 to Coffee Co."**
    and the customer confirms with face, fingerprint or PIN. The device signs
    the **intent**:

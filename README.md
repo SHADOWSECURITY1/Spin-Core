@@ -59,7 +59,10 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
   that payee, amount, currency, channel and expiry, used once. The approval is
   embedded in the receipt as dispute evidence. Apps provide a `PayerKeyStore`
   (enrolled public keys, spent nonces) that passes
-  `payerKeyStoreConformance`. Design: `docs/design/customer-signed-intent.md`.
+  `payerKeyStoreConformance`. Adding a device to an existing customer needs
+  an existing device's signed approval (`enrollmentChallenge`,
+  `verifyKeySignature`), so a stolen API key can't enroll an attacker's phone.
+  Design: `docs/design/customer-signed-intent.md`.
 - **Callers authorize only as themselves** (0.7). `resolve(input,
   { callerMerchantId })` takes the merchant from the app's authentication
   (the API key's merchant, or the card network's verified merchant id), not
