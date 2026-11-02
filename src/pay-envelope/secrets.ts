@@ -30,11 +30,14 @@ export const MIN_SECRET_LENGTH = 32;
  */
 export function resolvePayEnvelopeSecrets(
   env: Record<string, string | undefined> = process.env,
+  opts: { requireHmac?: boolean } = {},
 ): PayEnvelopeSecrets {
+  // With a hardware keyring (see keyring.ts) the HMAC secret isn't used.
+  const requireHmac = opts.requireHmac ?? true;
   const hmac = env.PAY_ENVELOPE_HMAC_SECRET;
   const jws = env.PAY_ENVELOPE_JWS_SECRET;
 
-  if (!hmac && !jws && env.PAY_ENVELOPE_DEV_SECRETS === "random") {
+  if (!jws && (!hmac || !requireHmac) && env.PAY_ENVELOPE_DEV_SECRETS === "random") {
     if (env.NODE_ENV === "production") {
       throw new PayEnvelopeConfigError(
         "PAY_ENVELOPE_DEV_SECRETS=random is not allowed when NODE_ENV=production",
@@ -55,6 +58,7 @@ export function resolvePayEnvelopeSecrets(
     ["PAY_ENVELOPE_HMAC_SECRET", hmac],
     ["PAY_ENVELOPE_JWS_SECRET", jws],
   ] as const) {
+    if (!value && name === "PAY_ENVELOPE_HMAC_SECRET" && !requireHmac) continue;
     if (!value) problems.push(`${name} is not set`);
     else if (value.length < MIN_SECRET_LENGTH)
       problems.push(`${name} must be at least ${MIN_SECRET_LENGTH} characters`);
@@ -70,13 +74,19 @@ export function resolvePayEnvelopeSecrets(
         "Generate each with `openssl rand -hex 32`.",
     );
   }
-  return { hmac: hmac!, jws: jws! };
+  return { hmac: hmac ?? "", jws: jws! };
 }
 
 /** Throws unless secrets passed in code meet the same bar as the env ones. */
-export function assertValidSecrets(secrets: PayEnvelopeSecrets): PayEnvelopeSecrets {
-  return resolvePayEnvelopeSecrets({
-    PAY_ENVELOPE_HMAC_SECRET: secrets.hmac,
-    PAY_ENVELOPE_JWS_SECRET: secrets.jws,
-  });
+export function assertValidSecrets(
+  secrets: PayEnvelopeSecrets,
+  opts: { requireHmac?: boolean } = {},
+): PayEnvelopeSecrets {
+  return resolvePayEnvelopeSecrets(
+    {
+      PAY_ENVELOPE_HMAC_SECRET: secrets.hmac || undefined,
+      PAY_ENVELOPE_JWS_SECRET: secrets.jws,
+    },
+    opts,
+  );
 }

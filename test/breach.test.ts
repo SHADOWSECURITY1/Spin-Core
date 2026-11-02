@@ -21,7 +21,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { MemoryPayEnvelopeStore, PayEnvelopeService, isValidLuhn } from "../src/index.js";
+import { MemoryPayEnvelopeStore, PayEnvelopeService, isValidLuhn, remotePanKeyring } from "../src/index.js";
 import type { TransactionContext } from "../src/index.js";
 
 const secrets = { hmac: randomBytes(32).toString("hex"), jws: randomBytes(32).toString("hex") };
@@ -35,10 +35,21 @@ function prng(seed: number) {
   };
 }
 
-async function scenario() {
+/** Keys held outside the app (a stand-in for KMS/HSM): never in env, secrets or the database. */
+function hardwareKeyring() {
+  const keys = { "pan-derive": randomBytes(32), "pan-fingerprint": randomBytes(32) };
+  return remotePanKeyring({
+    description: "kms",
+    mac: async (purpose, data) => new Uint8Array(createHmac("sha256", keys[purpose]).update(data).digest()),
+  });
+}
+
+async function scenario(opts: { hardware?: boolean } = {}) {
   let now = new Date("2026-11-02T12:00:00Z");
   const store = new MemoryPayEnvelopeStore();
-  const service = new PayEnvelopeService({ store, secrets, now: () => now });
+  const service = opts.hardware
+    ? new PayEnvelopeService({ store, secrets: { hmac: "", jws: secrets.jws }, keyring: hardwareKeyring(), now: () => now })
+    : new PayEnvelopeService({ store, secrets, now: () => now });
   const advance = (seconds: number) => (now = new Date(now.getTime() + seconds * 1000));
 
   const merchantLogs: { pan: string; context: TransactionContext }[] = [];
@@ -161,7 +172,26 @@ test("breach: a number seen at the wrong merchant stays dead, even with the righ
   }
 });
 
-test("known limit: the database copy plus the server's HMAC secret recomputes live numbers", async () => {
+test("with keys in hardware, the database plus every secret on the app server recomputes nothing", async () => {
+  const { live, records, dump } = await scenario({ hardware: true });
+  // The attacker owns the app server: its database and its whole environment.
+  const stolenSecrets = [secrets.jws, secrets.hmac];
+  const candidates = new Set<string>();
+  for (const key of stolenSecrets) {
+    for (const r of records) {
+      const msg = [r.id, r.createdAt.getTime(), r.merchantId, r.currency, r.amount, r.channel ?? ""].join("|");
+      const body9 = createHmac("sha256", key).update(msg).digest("hex").replace(/[a-f]/g, (c) => String(parseInt(c, 16) % 10)).slice(0, 9);
+      const partial = "411111" + body9;
+      candidates.add(partial + [...Array(10).keys()].map(String).find((d) => isValidLuhn(partial + d))!);
+    }
+  }
+  assert.equal(live.filter(({ pan }) => candidates.has(pan)).length, 0);
+  assert.equal(live.filter(({ pan }) => dump.includes(pan)).length, 0);
+  // What's left is asking the key service to fingerprint guesses: up to a
+  // billion requests per fingerprint, each one rate-limited and logged by KMS.
+});
+
+test("known limit (software keyring): the database copy plus the server's HMAC secret recomputes live numbers", async () => {
   const { live, records } = await scenario();
   // An attacker who also holds PAY_ENVELOPE_HMAC_SECRET can redo the derivation.
   const recompute = (r: (typeof records)[number]) => {

@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { isValidLuhn, projectPan } from "./luhn.js";
 import { planResolution } from "./evaluate.js";
 import { signReceipt } from "./receipt.js";
@@ -8,6 +8,7 @@ import {
   type PayEnvelopeSecrets,
 } from "./secrets.js";
 import type { PayEnvelopeStore } from "./store.js";
+import { softwarePanKeyring, type PanKeyring } from "./keyring.js";
 import type {
   CreatePayEnvelopeInput,
   CreatePayEnvelopeOutput,
@@ -23,7 +24,6 @@ export const MAX_TTL_SECONDS = 3600;
 /** Visa test BIN. Replace with an issuer-owned range in production. */
 export const DEFAULT_BIN = "411111";
 const MAX_PAN_ATTEMPTS = 5;
-const PAN_DIGEST_INFO = "spin/pay-envelope/pan-digest/v1";
 /** Prefix of a stored card-number fingerprint (versioned). */
 export const PAN_DIGEST_PREFIX = "d1:";
 
@@ -38,6 +38,12 @@ export interface PayEnvelopeServiceOptions<UserId, KeyId> {
   store: PayEnvelopeStore<UserId, KeyId>;
   /** Defaults to resolvePayEnvelopeSecrets(process.env), which fails closed. */
   secrets?: PayEnvelopeSecrets;
+  /**
+   * Where the card-number keys live. Defaults to softwarePanKeyring(secrets.hmac).
+   * In production pass a remotePanKeyring (KMS/HSM); the HMAC secret is then
+   * not needed. See keyring.ts.
+   */
+  keyring?: PanKeyring;
   bin6?: string;
   defaultTtlSeconds?: number;
   /** Injectable clock for tests. */
@@ -57,8 +63,7 @@ const newAuditRef = () => `aud_${randomBytes(8).toString("base64url")}`;
 export class PayEnvelopeService<UserId = string, KeyId = string> {
   private readonly store: PayEnvelopeStore<UserId, KeyId>;
   private readonly secrets: PayEnvelopeSecrets;
-  /** Keys card-number fingerprints; derived from the HMAC secret, domain-separated. */
-  private readonly digestKey: Buffer;
+  private readonly keyring: PanKeyring;
   private readonly bin6: string;
   private readonly defaultTtlSeconds: number;
   private readonly now: () => Date;
@@ -66,8 +71,11 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
 
   constructor(opts: PayEnvelopeServiceOptions<UserId, KeyId>) {
     this.store = opts.store;
-    this.secrets = opts.secrets ? assertValidSecrets(opts.secrets) : resolvePayEnvelopeSecrets();
-    this.digestKey = createHmac("sha256", this.secrets.hmac).update(PAN_DIGEST_INFO).digest();
+    const requireHmac = !opts.keyring;
+    this.secrets = opts.secrets
+      ? assertValidSecrets(opts.secrets, { requireHmac })
+      : resolvePayEnvelopeSecrets(process.env, { requireHmac });
+    this.keyring = opts.keyring ?? softwarePanKeyring(this.secrets.hmac);
     this.bin6 = opts.bin6 ?? DEFAULT_BIN;
     if (!/^\d{6}$/.test(this.bin6)) throw new Error("bin6 must be 6 digits");
     this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TTL_SECONDS;
@@ -101,7 +109,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
           existing.channel === (input.channel ?? null) &&
           existing.amountTolerancePpm === tolerancePpm;
         if (!same) throw new PayEnvelopeIdempotencyConflictError();
-        return this.toCreateOutput(existing);
+        return await this.toCreateOutput(existing);
       }
     }
 
@@ -122,7 +130,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     for (let attempt = 0; ; attempt++) {
       if (attempt === MAX_PAN_ATTEMPTS) throw new Error("Could not allocate a unique presentation PAN");
       envelopeId = newEnvelopeId();
-      pan = this.derivePan({
+      pan = await this.derivePan({
         id: envelopeId,
         createdAt,
         merchantId: input.merchantId,
@@ -130,7 +138,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
         amount: input.amount,
         channel: input.channel ?? null,
       });
-      panDigest = this.panDigest(pan);
+      panDigest = await this.panDigest(pan);
       if (!(await this.store.findByPanDigest(panDigest))) break;
     }
 
@@ -180,7 +188,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
 
     if (!/^\d{16}$/.test(pan)) return { decision: "DECLINE", reasonCode: "INVALID_PRESENTATION", auditRef };
 
-    const envelope = await this.store.findByPanDigest(this.panDigest(pan));
+    const envelope = await this.store.findByPanDigest(await this.panDigest(pan));
     if (!envelope) return { decision: "DECLINE", reasonCode: "UNKNOWN_PRESENTATION", auditRef };
 
     const plan = planResolution(envelope, input.txnContext, now);
@@ -247,26 +255,33 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
    * context, projected into a Luhn-valid PAN under this service's BIN.
    * Deterministic, so it is recomputed when needed instead of stored.
    */
-  private derivePan(e: Pick<PayEnvelopeRecord<unknown, unknown>, "id" | "createdAt" | "merchantId" | "currency" | "amount" | "channel">): string {
-    const digest = createHmac("sha256", this.secrets.hmac)
-      .update([e.id, e.createdAt.getTime(), e.merchantId, e.currency, e.amount, e.channel ?? ""].join("|"))
-      .digest("hex");
+  private async derivePan(
+    e: Pick<PayEnvelopeRecord<unknown, unknown>, "id" | "createdAt" | "merchantId" | "currency" | "amount" | "channel">,
+  ): Promise<string> {
+    const message = [e.id, e.createdAt.getTime(), e.merchantId, e.currency, e.amount, e.channel ?? ""].join("|");
+    const digest = Buffer.from(await this.keyring.mac("pan-derive", Buffer.from(message, "utf8"))).toString("hex");
     const body9 = digest.replace(/[a-f]/g, (c) => String(parseInt(c, 16) % 10)).slice(0, 9);
     const pan = projectPan(this.bin6, body9);
     if (!isValidLuhn(pan)) throw new Error("PAN projection failed Luhn validation");
     return pan;
   }
 
-  /** What the store keeps instead of the card number. Useless without the HMAC secret. */
-  private panDigest(pan: string): string {
-    return PAN_DIGEST_PREFIX + createHmac("sha256", this.digestKey).update(pan).digest("hex");
+  /** What the store keeps instead of the card number. Useless without the keyring. */
+  private async panDigest(pan: string): Promise<string> {
+    const mac = await this.keyring.mac("pan-fingerprint", Buffer.from(pan, "utf8"));
+    return PAN_DIGEST_PREFIX + Buffer.from(mac).toString("hex");
   }
 
-  private toCreateOutput(e: PayEnvelopeRecord<UserId, KeyId>): CreatePayEnvelopeOutput {
+  /** For health checks and startup logs: where the card-number keys live. */
+  get keyringDescription(): string {
+    return this.keyring.description;
+  }
+
+  private async toCreateOutput(e: PayEnvelopeRecord<UserId, KeyId>): Promise<CreatePayEnvelopeOutput> {
     return {
       envelopeId: e.id,
       expiresAt: e.expiresAt.toISOString(),
-      presentation: { pan: this.derivePan(e) },
+      presentation: { pan: await this.derivePan(e) },
       receiptJws: e.receiptJws ?? "",
     };
   }
