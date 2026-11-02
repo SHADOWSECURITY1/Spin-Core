@@ -2,6 +2,7 @@ export * from "./types.js";
 export * from "./luhn.js";
 export * from "./secrets.js";
 export * from "./keyring.js";
+export * from "./intent.js";
 export * from "./receipt.js";
 export * from "./api-keys.js";
 export * from "./evaluate.js";

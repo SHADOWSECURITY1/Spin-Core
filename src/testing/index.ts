@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import type { PayEnvelopeStore } from "../pay-envelope/store.js";
 import type { NewPayEnvelope } from "../pay-envelope/types.js";
+import type { PayerKey, PayerKeyStore } from "../pay-envelope/intent.js";
 
 export interface ConformanceOptions<UserId, KeyId> {
   /** Return a store over an empty or isolated dataset. Called once per case. */
@@ -200,6 +201,73 @@ export function payEnvelopeStoreConformance<UserId, KeyId>(
         assert.ok(!(claimed && expired), "envelope was both claimed and expired");
         assert.ok(claimed || expired, "neither claim nor expire succeeded");
       }),
+    },
+  ];
+}
+
+/**
+ * Conformance for a PayerKeyStore (customer-signed intent). The property that
+ * matters: an approval's nonce can be spent exactly once, even under
+ * concurrency; otherwise one customer approval could create two credentials.
+ *
+ * `makeStore` returns an empty store; `addKey` enrolls a key in it the way the
+ * app does (e.g. an INSERT into its payer-keys table).
+ */
+export function payerKeyStoreConformance(opts: {
+  makeStore: () => Promise<PayerKeyStore> | PayerKeyStore;
+  addKey: (store: PayerKeyStore, key: PayerKey) => Promise<void>;
+  revokeKey: (store: PayerKeyStore, payerId: string, keyId: string, at: Date) => Promise<void>;
+}): ConformanceCase[] {
+  const key = (payerId: string, keyId: string): PayerKey => ({
+    payerId,
+    keyId,
+    scheme: "ed25519",
+    publicKey: randomBytes(44).toString("base64url"),
+    revokedAt: null,
+  });
+  const later = () => new Date(Date.now() + 60_000);
+  return [
+    {
+      name: "payer keys: enrolled keys are found by payer and key id, and only there",
+      run: async () => {
+        const store = await opts.makeStore();
+        const k = key("alice", "phone-1");
+        await opts.addKey(store, k);
+        const found = await store.findKey("alice", "phone-1");
+        assert.equal(found?.publicKey, k.publicKey);
+        assert.equal(found?.scheme, "ed25519");
+        assert.equal(found?.revokedAt, null);
+        assert.equal(await store.findKey("bob", "phone-1"), null, "another payer's key id");
+        assert.equal(await store.findKey("alice", "phone-2"), null);
+      },
+    },
+    {
+      name: "payer keys: revocation is visible",
+      run: async () => {
+        const store = await opts.makeStore();
+        await opts.addKey(store, key("alice", "phone-1"));
+        await opts.revokeKey(store, "alice", "phone-1", new Date());
+        assert.ok((await store.findKey("alice", "phone-1"))?.revokedAt instanceof Date);
+      },
+    },
+    {
+      name: "payer keys: a nonce is spent once, per payer",
+      run: async () => {
+        const store = await opts.makeStore();
+        assert.equal(await store.useNonce("alice", "n-0123456789abcdef", later()), true);
+        assert.equal(await store.useNonce("alice", "n-0123456789abcdef", later()), false);
+        assert.equal(await store.useNonce("bob", "n-0123456789abcdef", later()), true, "nonces are per payer");
+      },
+    },
+    {
+      name: "payer keys: 8 concurrent uses of one nonce: exactly one wins",
+      run: async () => {
+        const store = await opts.makeStore();
+        const results = await Promise.all(
+          Array.from({ length: 8 }, () => store.useNonce("alice", "n-race-0123456789", later())),
+        );
+        assert.equal(results.filter(Boolean).length, 1);
+      },
     },
   ];
 }
