@@ -22,7 +22,7 @@ import { secureRandom } from './random.js';
  * CK). Chains only move forward, so holding today's chain key reveals nothing
  * about earlier messages.
  *
- * Known limits of v1 (unchanged here): no DH ratchet, so no post-compromise
+ * Known limits: no DH ratchet, so no post-compromise
  * security; skipped message keys are discarded, so out-of-order delivery past
  * the chain position is unreadable by design.
  */
@@ -31,6 +31,7 @@ const PQXDH_INFO = 'spin-vault/pqxdh/v1';
 const CK_INIT_A = 'spin-vault/ratchet/chain/initiator->responder/v1';
 const CK_INIT_B = 'spin-vault/ratchet/chain/responder->initiator/v1';
 const MK_INFO = 'spin-vault/ratchet/mk/v1';
+const SID_INFO = 'spin-vault/ratchet/sid/v1';
 const CK_INFO = 'spin-vault/ratchet/ck/v1';
 const KYBER_CIPHERTEXT_BYTES = 1088;
 export const DEFAULT_MAX_SKIP = 256;
@@ -234,26 +235,37 @@ export async function unwrapSession(wrappedState: string, stateIv: string, maste
 
 // ── session convenience ──────────────────────────────────────────────────────
 
+/**
+ * A public 8-byte id for a session (hex), derived from its root key so both
+ * parties compute the same value. Lets messages say which session they belong
+ * to when a conversation has more than one (see SessionStore).
+ */
+export function sessionIdFromRoot(rootKey: Uint8Array): string {
+  return bytesToHex(hkdf32(rootKey, SID_INFO).slice(0, 8));
+}
+
 export function establishAsInitiator(
   myIdentityX25519Priv: Uint8Array,
   myIdentityX25519Pub: string,
   bundle: PreKeyBundle,
-): { session: Session; header: HandshakeHeader } {
+): { session: Session; header: HandshakeHeader; sessionId: string } {
   const { rootKey, header } = initiateSession({ identityX25519Priv: myIdentityX25519Priv, identityX25519Pub: myIdentityX25519Pub }, bundle);
   const session = initSession(rootKey, 'initiator');
+  const sessionId = sessionIdFromRoot(rootKey);
   rootKey.fill(0);
-  return { session, header };
+  return { session, header, sessionId };
 }
 
 export function establishAsResponder(
   header: HandshakeHeader,
   myIdentity: IdentitySecret,
   oneTime: OneTimePreKeySecret,
-): { session: Session } {
+): { session: Session; sessionId: string } {
   const { rootKey } = respondToSession(header, myIdentity, oneTime);
   const session = initSession(rootKey, 'responder');
+  const sessionId = sessionIdFromRoot(rootKey);
   rootKey.fill(0);
-  return { session };
+  return { session, sessionId };
 }
 
 export function sessionEncrypt(session: Session, plaintext: string): { session: Session; message: RatchetMessage } {
@@ -264,4 +276,86 @@ export function sessionEncrypt(session: Session, plaintext: string): { session: 
 export function sessionDecrypt(session: Session, message: RatchetMessage): { session: Session; plaintext: string } {
   const { recv, plaintext } = ratchetDecrypt(session.recv, message);
   return { session: { ...session, recv }, plaintext };
+}
+
+// ── per-conversation session store (v2) ──────────────────────────────────────
+
+/**
+ * Everything one user keeps about their conversation with one peer: the
+ * active session (used to send) plus up to MAX_PREVIOUS_SESSIONS older ones,
+ * kept receive-only so messages still in flight on them can be read.
+ *
+ * Stored sealed with the master key, in the same field as v1 sessions.
+ * Layout v2: [2][count] then per entry [flags][sid:8][sendN:4][recvN:4]
+ * [sendCk:32][recvCk:32], active entry first. flags: bit0 has sid, bit1 we
+ * initiated. A v1 blob (one 73-byte session) reads as an active entry with
+ * no id, initiated by an unknown party.
+ */
+export interface StoredSession {
+  session: Session;
+  sessionId: string | null; // null: a v1 session from before ids existed
+  initiatedByMe: boolean;
+}
+export interface SessionStore {
+  active: StoredSession;
+  previous: StoredSession[]; // newest first, receive-only
+}
+
+export const MAX_PREVIOUS_SESSIONS = 4;
+const STORE_VERSION = 2;
+const ENTRY_BYTES = 1 + 8 + 4 + 4 + 32 + 32;
+
+export function serializeSessionStore(store: SessionStore): Uint8Array {
+  const entries = [store.active, ...store.previous.slice(0, MAX_PREVIOUS_SESSIONS)];
+  const out = new Uint8Array(2 + entries.length * ENTRY_BYTES);
+  const dv = new DataView(out.buffer);
+  out[0] = STORE_VERSION;
+  out[1] = entries.length;
+  entries.forEach((e, i) => {
+    const o = 2 + i * ENTRY_BYTES;
+    out[o] = (e.sessionId ? 1 : 0) | (e.initiatedByMe ? 2 : 0);
+    if (e.sessionId) out.set(hexToBytes(e.sessionId), o + 1);
+    dv.setUint32(o + 9, e.session.send.n);
+    dv.setUint32(o + 13, e.session.recv.n);
+    out.set(e.session.send.chainKey, o + 17);
+    out.set(e.session.recv.chainKey, o + 49);
+  });
+  return out;
+}
+
+export function deserializeSessionStore(bytes: Uint8Array): SessionStore {
+  if (bytes[0] === SESSION_VERSION) {
+    return { active: { session: deserializeSession(bytes), sessionId: null, initiatedByMe: false }, previous: [] };
+  }
+  const count = bytes[1] ?? 0;
+  if (bytes[0] !== STORE_VERSION || count < 1 || bytes.length !== 2 + count * ENTRY_BYTES) {
+    throw new Error('Unsupported or corrupt session state');
+  }
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const entries: StoredSession[] = [];
+  for (let i = 0; i < count; i++) {
+    const o = 2 + i * ENTRY_BYTES;
+    const flags = bytes[o]!;
+    entries.push({
+      sessionId: flags & 1 ? bytesToHex(bytes.slice(o + 1, o + 9)) : null,
+      initiatedByMe: (flags & 2) !== 0,
+      session: {
+        send: { n: dv.getUint32(o + 9), chainKey: bytes.slice(o + 17, o + 49) },
+        recv: { n: dv.getUint32(o + 13), chainKey: bytes.slice(o + 49, o + 81) },
+      },
+    });
+  }
+  return { active: entries[0]!, previous: entries.slice(1) };
+}
+
+export async function wrapSessionStore(store: SessionStore, masterKey: MasterKey): Promise<{ wrappedState: string; stateIv: string }> {
+  const plain = serializeSessionStore(store);
+  const { sealed, iv } = await sealSecret(plain, masterKey);
+  plain.fill(0);
+  return { wrappedState: bytesToBase64(sealed), stateIv: bytesToHex(iv) };
+}
+
+/** Reads v2 stores and v1 single-session blobs. */
+export async function unwrapSessionStore(wrappedState: string, stateIv: string, masterKey: MasterKey): Promise<SessionStore> {
+  return deserializeSessionStore(await masterKey.open(hexToBytes(stateIv), base64ToBytes(wrappedState)));
 }
