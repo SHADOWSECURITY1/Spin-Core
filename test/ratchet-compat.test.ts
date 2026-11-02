@@ -58,7 +58,8 @@ test('the web-written conversation continues in @spin/core, in both directions',
   // Alice continues her existing chain (n = 2, no new handshake).
   const sent = await sendMessage(alice, server.transportFor(1), 2, 'third');
   assert.equal(sent.ratchetN, 2);
-  assert.equal(server.messages.at(-1).ratchetHeader, null);
+  // Her pre-0.4 session learned its id from Bob's reply; no new handshake.
+  assert.deepEqual(Object.keys(JSON.parse(server.messages.at(-1).ratchetHeader)), ['sid']);
   const bobRead = await decryptIncoming(bob, server.transportFor(2), 1, server.inbox(2, 1));
   assert.equal(bobRead.get(sent.messageId), 'third');
 });

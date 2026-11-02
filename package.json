@@ -1,6 +1,6 @@
 {
   "name": "@spin/core",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Shared SPIN security core: the Pay Envelope, and SPIN Vault's zero-knowledge file and post-quantum messaging crypto.",
   "private": true,
   "license": "UNLICENSED",

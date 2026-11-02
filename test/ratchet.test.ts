@@ -19,6 +19,8 @@ import {
   sendMessage,
   serializeSession,
   unwrapSession,
+  unwrapSessionStore,
+  wrapSessionStore,
   wrapSession,
   PREKEY_BATCH,
   type FsIdentity,
@@ -163,5 +165,118 @@ describe('fs-messaging orchestration', () => {
       { id: 2, senderId: 1, ratchetN: null, ratchetHeader: null, encryptedContent: '', encryptionIV: '' },
     ]);
     assert.equal(out.size, 0);
+  });
+
+  test('a handshake naming the wrong identity key is refused and burns no prekey', async () => {
+    const server = makeFsServer();
+    const alice = await user(1, server), bob = await user(2, server);
+    const mallory = await user(3, server);
+    await ensurePrekeyPool(bob, server.transportFor(2));
+    // Mallory's message, relabelled by a hostile server as coming from Alice.
+    await sendMessage(mallory, server.transportFor(3), 2, 'I am alice');
+    const forged = server.messages.at(-1);
+    forged.senderId = 1;
+    const r = await decryptIncoming(bob, server.transportFor(2), 1, server.inbox(2, 1));
+    assert.deepEqual([...r.values()], ['[Unverified sender]']);
+    assert.equal(server.prekeys.get(2)!.size, PREKEY_BATCH);
+    assert.equal(server.sessions.get('2:1'), undefined);
+    // Alice's real message afterwards still opens a session.
+    await sendMessage(alice, server.transportFor(1), 2, 'really alice');
+    const r2 = await decryptIncoming(bob, server.transportFor(2), 1, server.inbox(2, 1));
+    assert.equal(r2.get(server.messages.at(-1).id), 'really alice');
+    assert.equal(server.prekeys.get(2)!.size, PREKEY_BATCH - 1);
+  });
+
+  test("a handshake claiming the sender's key without its private key is unreadable and burns no prekey", async () => {
+    const server = makeFsServer();
+    const alice = await user(1, server), bob = await user(2, server);
+    const mallory = await user(3, server);
+    await ensurePrekeyPool(bob, server.transportFor(2));
+    // Mallory claims Alice's public identity key in the handshake.
+    const fake: FsIdentity = { ...mallory, userId: 1, x25519Pub: alice.x25519Pub };
+    await sendMessage(fake, server.transportFor(1), 2, 'spoof');
+    const r = await decryptIncoming(bob, server.transportFor(2), 1, server.inbox(2, 1));
+    assert.deepEqual([...r.values()], ['[Unreadable]']);
+    assert.equal(server.prekeys.get(2)!.size, PREKEY_BATCH);
+    assert.equal(server.sessions.get('2:1'), undefined);
+  });
+
+  test("the sender refuses a bundle that doesn't carry the peer's known identity key", async () => {
+    const server = makeFsServer();
+    const alice = await user(1, server), bob = await user(2, server);
+    await ensurePrekeyPool(bob, server.transportFor(2));
+    const t = { ...server.transportFor(1), getIdentityKey: async () => ({ x25519: alice.x25519Pub }) };
+    await assert.rejects(sendMessage(alice, t, 2, 'x'), /doesn't match/);
+    assert.equal(server.messages.length, 0);
+    void bob;
+  });
+
+  test('glare: both open at once, both converge, every first message reads', async () => {
+    const server = makeFsServer();
+    const alice = await user(1, server), bob = await user(2, server);
+    await ensurePrekeyPool(alice, server.transportFor(1));
+    await ensurePrekeyPool(bob, server.transportFor(2));
+    await sendMessage(alice, server.transportFor(1), 2, 'a1');
+    await sendMessage(bob, server.transportFor(2), 1, 'b1');
+    await sendMessage(alice, server.transportFor(1), 2, 'a2');
+    await sendMessage(bob, server.transportFor(2), 1, 'b2');
+    assert.deepEqual([...(await decryptIncoming(alice, server.transportFor(1), 2, server.inbox(1, 2))).values()], ['b1', 'b2']);
+    assert.deepEqual([...(await decryptIncoming(bob, server.transportFor(2), 1, server.inbox(2, 1))).values()], ['a1', 'a2']);
+    // Both now send on the same session, and each reads the other.
+    await sendMessage(alice, server.transportFor(1), 2, 'a3');
+    await sendMessage(bob, server.transportFor(2), 1, 'b3');
+    const sidOf = (m: any) => JSON.parse(m.ratchetHeader).sid;
+    assert.equal(sidOf(server.messages.at(-1)), sidOf(server.messages.at(-2)));
+    const a = await decryptIncoming(alice, server.transportFor(1), 2, server.inbox(1, 2));
+    const b = await decryptIncoming(bob, server.transportFor(2), 1, server.inbox(2, 1));
+    assert.equal(a.get(server.messages.at(-1).id), 'b3');
+    assert.equal(b.get(server.messages.at(-2).id), 'a3');
+  });
+
+  test('glare resolves the same way whichever side reads first', async () => {
+    for (const first of [1, 2]) {
+      const server = makeFsServer();
+      const alice = await user(1, server), bob = await user(2, server);
+      await ensurePrekeyPool(alice, server.transportFor(1));
+      await ensurePrekeyPool(bob, server.transportFor(2));
+      await sendMessage(alice, server.transportFor(1), 2, 'a1');
+      await sendMessage(bob, server.transportFor(2), 1, 'b1');
+      const read = (me: FsIdentity, peer: number) => decryptIncoming(me, server.transportFor(me.userId), peer, server.inbox(me.userId, peer));
+      if (first === 1) { await read(alice, 2); await read(bob, 1); } else { await read(bob, 1); await read(alice, 2); }
+      await sendMessage(alice, server.transportFor(1), 2, 'a2');
+      await sendMessage(bob, server.transportFor(2), 1, 'b2');
+      assert.equal((await read(bob, 1)).get(server.messages.at(-2).id), 'a2');
+      assert.equal((await read(alice, 2)).get(server.messages.at(-1).id), 'b2');
+    }
+  });
+
+  test('a peer re-opening a session takes over; late messages on the old one still read', async () => {
+    const server = makeFsServer();
+    const alice = await user(1, server), bob = await user(2, server);
+    await ensurePrekeyPool(bob, server.transportFor(2));
+    await sendMessage(alice, server.transportFor(1), 2, 'old-1');
+    await decryptIncoming(bob, server.transportFor(2), 1, server.inbox(2, 1));
+    await sendMessage(bob, server.transportFor(2), 1, 'reply');
+    await decryptIncoming(alice, server.transportFor(1), 2, server.inbox(1, 2));
+    await sendMessage(alice, server.transportFor(1), 2, 'old-2'); // still in flight
+    const late = server.messages.at(-1).id;
+    server.sessions.delete('1:2'); // Alice loses her session (new device) and re-opens
+    await sendMessage(alice, server.transportFor(1), 2, 'new-1');
+    const r = await decryptIncoming(bob, server.transportFor(2), 1, server.inbox(2, 1));
+    assert.equal(r.get(late), 'old-2');
+    assert.equal(r.get(server.messages.at(-1).id), 'new-1');
+    await sendMessage(bob, server.transportFor(2), 1, 'on the new one');
+    const a = await decryptIncoming(alice, server.transportFor(1), 2, server.inbox(1, 2));
+    assert.equal(a.get(server.messages.at(-1).id), 'on the new one');
+  });
+
+  test('a stored v1 session loads as the active session of a store', async () => {
+    const { a } = handshake();
+    const mk = rawMasterKey(await deriveMasterKeyBytes('pw', '00'.repeat(32)));
+    const w = await wrapSession(a, mk);
+    const store = await unwrapSessionStore(w.wrappedState, w.stateIv, mk);
+    assert.deepEqual(store, { active: { session: a, sessionId: null, initiatedByMe: false }, previous: [] });
+    const again = await unwrapSessionStore(...Object.values(await wrapSessionStore(store, mk)) as [string, string], mk);
+    assert.deepEqual(again, store);
   });
 });

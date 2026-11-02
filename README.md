@@ -66,15 +66,22 @@ the package root contains Node-only code.
 | Messages | `encryptMessage` / `decryptMessage`: hybrid X25519 + ML-KEM-768. The DEK's wrapping key is HKDF of **both** shared secrets, so breaking one KEM isn't enough. |
 | Forward secrecy | `ensurePrekeyPool` / `sendMessage` / `decryptIncoming` over an app-supplied `FsTransport`; underneath, a PQXDH-style handshake (3 × X25519 + 2 × ML-KEM-768 with one-time prekeys) into a symmetric-key ratchet. Read messages expire as the chain moves on. Session state is sealed with the master key for server storage. |
 
-**Forward secrecy, known limits (v1, unchanged):** no DH ratchet, so no
-post-compromise security; out-of-order messages behind the chain are
-unreadable; the responder doesn't check the handshake's initiator identity
-against the sender's known key; and if both sides open a session at the same
-moment, each keeps its own and the other's first messages read as
-`[expired]`.
+**Forward secrecy, identity and simultaneous starts (0.4).** Apps supply
+`FsTransport.getIdentityKey(peerId)` (a pinned key if the app has one). A
+handshake is accepted only if it names the sender's known identity key, and
+the one-time prekey is deleted only after the first message decrypts, so a
+forged handshake reads `[Unverified sender]` or `[Unreadable]` and costs
+nothing. If both sides open a session at once, both converge on the one
+opened by the lower identity key; the other stays receive-only, so every
+first message still reads. Session state is now a small store (v2) that
+still reads v1 sessions.
 
-**Wire format: unchanged.** Field names and encodings are exactly what SPIN
-Vault web and mobile already store. `test/fixtures/` holds payloads produced
+**Known limits:** no DH ratchet, so no post-compromise security; out-of-order
+messages behind the chain are unreadable.
+
+**Wire format: compatible.** Field names and encodings are what SPIN Vault
+web and mobile already store; 0.4 adds a session id to `ratchetHeader` and
+the v2 session store, and still reads everything written before. `test/fixtures/` holds payloads produced
 by the real pre-`@spin/core` web and mobile code; the tests must keep opening
 them. Changing the format means a new version label, not editing v1.
 

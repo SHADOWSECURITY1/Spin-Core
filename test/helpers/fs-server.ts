@@ -31,6 +31,10 @@ export function makeFsServer(dump?: {
     },
     async getPrekeyPrivate(keyId) { return prekeys.get(me)?.get(keyId) ?? null; },
     async deletePrekey(keyId) { prekeys.get(me)?.delete(keyId); },
+    async getIdentityKey(peer) {
+      const id = identities.get(peer);
+      return id ? { x25519: id.x25519 } : null;
+    },
     async getSession(peer) { return sessions.get(`${me}:${peer}`) ?? null; },
     async putSession(peer, wrappedState, stateIv) { sessions.set(`${me}:${peer}`, { wrappedState, stateIv }); },
     async postMessage(body: any) {
