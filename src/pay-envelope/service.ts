@@ -9,6 +9,14 @@ import {
 } from "./secrets.js";
 import type { PayEnvelopeStore } from "./store.js";
 import { softwarePanKeyring, type PanKeyring } from "./keyring.js";
+import {
+  PayEnvelopeIntentError,
+  isWellFormedIntent,
+  verifySignedIntent,
+  type PayerKeyStore,
+  type SignedIntent,
+  type WebAuthnPolicy,
+} from "./intent.js";
 import type {
   CreatePayEnvelopeInput,
   CreatePayEnvelopeOutput,
@@ -44,6 +52,13 @@ export interface PayEnvelopeServiceOptions<UserId, KeyId> {
    * not needed. See keyring.ts.
    */
   keyring?: PanKeyring;
+  /**
+   * Enrolled customer keys and spent approval nonces. Required to accept
+   * customer-signed intents (docs/design/customer-signed-intent.md).
+   */
+  payerKeys?: PayerKeyStore;
+  /** Where passkey (webauthn-es256) approvals may come from. */
+  webauthn?: WebAuthnPolicy;
   bin6?: string;
   defaultTtlSeconds?: number;
   /** Injectable clock for tests. */
@@ -64,6 +79,8 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
   private readonly store: PayEnvelopeStore<UserId, KeyId>;
   private readonly secrets: PayEnvelopeSecrets;
   private readonly keyring: PanKeyring;
+  private readonly payerKeys: PayerKeyStore | undefined;
+  private readonly webauthn: WebAuthnPolicy | undefined;
   private readonly bin6: string;
   private readonly defaultTtlSeconds: number;
   private readonly now: () => Date;
@@ -76,6 +93,8 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
       ? assertValidSecrets(opts.secrets, { requireHmac })
       : resolvePayEnvelopeSecrets(process.env, { requireHmac });
     this.keyring = opts.keyring ?? softwarePanKeyring(this.secrets.hmac);
+    this.payerKeys = opts.payerKeys;
+    this.webauthn = opts.webauthn;
     this.bin6 = opts.bin6 ?? DEFAULT_BIN;
     if (!/^\d{6}$/.test(this.bin6)) throw new Error("bin6 must be 6 digits");
     this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TTL_SECONDS;
@@ -84,9 +103,19 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
       opts.onEventError ?? ((err) => console.error("[pay-envelope] event error:", err));
   }
 
+  /**
+   * Create a single-use credential.
+   *
+   * With `signedIntent`, it is created only if the customer signed exactly
+   * this payee, amount, currency and channel on an enrolled device, the
+   * approval is unexpired and unused, and no amount tolerance is asked for.
+   * With `requireCustomerSignature` and no `signedIntent`, nothing is created.
+   * Rejections throw PayEnvelopeIntentError with a code.
+   */
   async create(
     input: CreatePayEnvelopeInput,
     owner: EnvelopeOwner<UserId, KeyId>,
+    opts: { signedIntent?: SignedIntent; requireCustomerSignature?: boolean } = {},
   ): Promise<CreatePayEnvelopeOutput> {
     if (!Number.isInteger(input.amount) || input.amount <= 0) {
       throw new RangeError("amount must be a positive integer (minor units)");
@@ -118,7 +147,15 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
       MAX_TTL_SECONDS,
       Math.max(MIN_TTL_SECONDS, input.ttlSeconds ?? this.defaultTtlSeconds),
     );
-    const expiresAt = new Date(createdAt.getTime() + ttl * 1000);
+    let expiresAt = new Date(createdAt.getTime() + ttl * 1000);
+
+    const si = opts.signedIntent;
+    if (!si && opts.requireCustomerSignature) {
+      throw new PayEnvelopeIntentError("intent_required", "This API key requires a customer-signed intent.");
+    }
+    if (si) {
+      expiresAt = await this.checkSignedIntent(si, input, tolerancePpm, createdAt, expiresAt);
+    }
 
     // The presentation PAN is derived from the envelope's context via HMAC,
     // so it can't be predicted without the secret. 9 digits of body means
@@ -151,6 +188,9 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
         amount: input.amount,
         currency: input.currency,
         expiresAt: expiresAt.toISOString(),
+        // The customer's own signed approval: verifiable with their public key,
+        // without trusting SPIN. Dispute evidence.
+        ...(si ? { customerApproval: si } : {}),
       },
       { now: createdAt },
     );
@@ -264,6 +304,55 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     const envelope = await this.store.findById(envelopeId);
     if (!envelope || (owner && envelope.payKeyId !== owner.payKeyId)) return null;
     return envelope;
+  }
+
+  /**
+   * Verify a customer-signed intent against this create request. Returns the
+   * expiry to use (never later than the approval). The nonce is spent last,
+   * so a rejected request doesn't use up the customer's approval.
+   */
+  private async checkSignedIntent(
+    si: SignedIntent,
+    input: CreatePayEnvelopeInput,
+    tolerancePpm: number | null,
+    now: Date,
+    expiresAt: Date,
+  ): Promise<Date> {
+    if (!this.payerKeys) {
+      throw new PayEnvelopeIntentError("intent_invalid", "Customer-signed intents are not enabled on this server.");
+    }
+    if (!isWellFormedIntent(si.intent) || typeof si.keyId !== "string" || typeof si.signature !== "string") {
+      throw new PayEnvelopeIntentError("intent_invalid", "Malformed signed intent.");
+    }
+    const intent = si.intent;
+    const key = await this.payerKeys.findKey(intent.payerId, si.keyId);
+    if (!key || key.revokedAt || !verifySignedIntent(si, key, this.webauthn)) {
+      throw new PayEnvelopeIntentError("intent_invalid", "The customer's signature is not valid for an enrolled device.");
+    }
+    if (
+      intent.merchantId !== input.merchantId ||
+      intent.amount !== input.amount ||
+      intent.currency !== input.currency ||
+      intent.channel !== (input.channel ?? null) ||
+      tolerancePpm !== null
+    ) {
+      throw new PayEnvelopeIntentError(
+        "intent_mismatch",
+        "The request doesn't match what the customer approved (payee, exact amount, currency, channel; no tolerance).",
+      );
+    }
+    const approvedUntil = Date.parse(intent.expiresAt);
+    if (approvedUntil - now.getTime() < MIN_TTL_SECONDS * 1000) {
+      throw new PayEnvelopeIntentError("intent_expired", "The customer's approval has expired.");
+    }
+    if (approvedUntil - now.getTime() > MAX_TTL_SECONDS * 1000) {
+      throw new PayEnvelopeIntentError("intent_invalid", "A customer approval may last at most an hour.");
+    }
+    const until = new Date(Math.min(expiresAt.getTime(), approvedUntil));
+    if (!(await this.payerKeys.useNonce(intent.payerId, intent.nonce, new Date(approvedUntil)))) {
+      throw new PayEnvelopeIntentError("intent_replayed", "This approval was already used.");
+    }
+    return until;
   }
 
   /**

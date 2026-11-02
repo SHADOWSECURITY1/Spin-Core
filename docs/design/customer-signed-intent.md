@@ -1,7 +1,10 @@
 # Step 2: customer-signed intent
 
-Status: proposal (2026-11-02). Builds on the Pay Envelope (0.7), the breach
-test, and the PanKeyring (card-number keys in KMS).
+Status: phase 1 core implemented in @spin/core 0.8.0 (2026-11-02): intent
+format, the three signature schemes, `PayerKeyStore` + conformance suite,
+create-time checks, approval in the receipt, breach tests 1-4. Next: SPIN Pay
+enrollment endpoints, tables, per-key flag, docs, browser helper. Builds on
+the Pay Envelope (0.7), the breach test, and the PanKeyring.
 
 ## The problem
 
@@ -114,10 +117,9 @@ the mandate; a stolen integrator API key alone can create nothing.
   and nonces, a per-key `requireCustomerSignature` flag, docs, and a small
   browser helper for passkey/SPC.
 
-## Decisions needed
+## Decisions (2026-11-02)
 
-1. Phase 1 scope: online flows only (recommended), or include the offline
-   allowance now?
-2. Offline allowance default cap and window (proposed $50 / 24 hours).
-3. Whether test keys require signatures from day one (proposed: no, to keep
-   onboarding simple; live keys always do).
+1. Phase 1 is online flows only. The merchant relay comes with in-person
+   support; the offline allowance comes later, opt-in.
+2. Offline allowance defaults, when built: $50 in total over 24 hours.
+3. Test keys don't require signatures; live keys always do.

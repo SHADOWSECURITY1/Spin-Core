@@ -21,7 +21,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { MemoryPayEnvelopeStore, PayEnvelopeService, isValidLuhn, remotePanKeyring } from "../src/index.js";
+import {
+  MemoryPayEnvelopeStore,
+  MemoryPayerKeyStore,
+  PayEnvelopeIntentError,
+  PayEnvelopeService,
+  isValidLuhn,
+  remotePanKeyring,
+  type SignedIntent,
+} from "../src/index.js";
+import { RP, ed25519Device, intentFor, passkeyDevice } from "./helpers/customer-device.js";
 import type { TransactionContext } from "../src/index.js";
 
 const secrets = { hmac: randomBytes(32).toString("hex"), jws: randomBytes(32).toString("hex") };
@@ -230,4 +239,85 @@ test("known limit (software keyring): the database copy plus the server's HMAC s
   // Documented, not desired: today the secret is the only barrier. A device-held
   // half (split key) makes this test fail, at which point it should be inverted.
   assert.ok(live.every(({ pan }) => recomputed.has(pan)));
+});
+
+// ── Customer-signed intent (docs/design/customer-signed-intent.md) ──────────
+// The attacker now holds the integrator's live API key, or controls its
+// server: they can call create with anything they like.
+
+function intentScenario() {
+  const payerKeys = new MemoryPayerKeyStore();
+  const store = new MemoryPayEnvelopeStore();
+  const service = new PayEnvelopeService({ store, secrets, payerKeys, webauthn: RP });
+  const alice = ed25519Device("alice");
+  const alicePasskey = passkeyDevice("alice");
+  payerKeys.add(alice.key);
+  payerKeys.add(alicePasskey.key);
+  const integrator = { userId: "integrator", payKeyId: "key_live" };
+  const create = (input: object, signedIntent?: SignedIntent) =>
+    service.create({ merchantId: "coffee-co", amount: 450, currency: "USD", channel: "CNP", ...input }, integrator, {
+      signedIntent,
+      requireCustomerSignature: true,
+    });
+  return { service, store, payerKeys, alice, alicePasskey, create };
+}
+
+const refused = async (p: Promise<unknown>) => {
+  try {
+    await p;
+    return false;
+  } catch (e) {
+    return e instanceof PayEnvelopeIntentError;
+  }
+};
+
+test("breach (signed intent): a stolen integrator API key alone creates nothing", async () => {
+  const { store, create } = intentScenario();
+  assert.ok(await refused(create({ merchantId: "m_attacker", amount: 450_000 })));
+  // Signing with the attacker's own key, claiming to be Alice, is no better.
+  const mallory = ed25519Device("alice", "phone-1"); // same ids, different key
+  assert.ok(await refused(create({ merchantId: "m_attacker" }, mallory.sign(intentFor("alice", { merchantId: "m_attacker" })))));
+  assert.equal(store.envelopes.size, 0);
+});
+
+test("breach (signed intent): Alice's approval of $4.50 to Coffee Co. can't become anything else", async () => {
+  const { store, alice, alicePasskey, create } = intentScenario();
+  for (const device of [alice, alicePasskey]) {
+    const si = device.sign(intentFor("alice"));
+    for (const changed of [
+      { amount: 450_000 },
+      { merchantId: "m_attacker" },
+      { currency: "EUR" },
+      { channel: "CP" },
+      { amountTolerance: 1 },
+    ]) {
+      assert.ok(await refused(create(changed, si)), `accepted ${JSON.stringify(changed)}`);
+    }
+    // Editing the approval itself breaks the customer's signature.
+    const edited = { ...si, intent: { ...si.intent, merchantId: "m_attacker", amount: 450_000 } };
+    assert.ok(await refused(create({ merchantId: "m_attacker", amount: 450_000 }, edited)));
+  }
+  assert.equal(store.envelopes.size, 0);
+});
+
+test("breach (signed intent): one approval, one credential", async () => {
+  const { store, alice, create } = intentScenario();
+  const si = alice.sign(intentFor("alice"));
+  await create({}, si);
+  const replays = await Promise.all(Array.from({ length: 5 }, () => refused(create({}, si))));
+  assert.ok(replays.every(Boolean));
+  assert.equal(store.envelopes.size, 1);
+});
+
+test("breach (signed intent): SPIN's whole database (public keys, spent nonces, receipts) can't sign an approval", async () => {
+  const { store, payerKeys, alice, create } = intentScenario();
+  await create({}, alice.sign(intentFor("alice")));
+  const dump = JSON.stringify({ keys: [...payerKeys.keys.values()], spent: [...payerKeys.spent.keys()], envelopes: [...store.envelopes.values()] });
+  // Everything stored is public material: reusing any of it as a signature fails.
+  const scraps = [...new Set(dump.match(/[A-Za-z0-9_-]{40,}/g) ?? [])];
+  for (const scrap of scraps) {
+    const forged = { intent: intentFor("alice", { merchantId: "m_attacker" }), keyId: "phone-1", signature: scrap };
+    assert.ok(await refused(create({ merchantId: "m_attacker" }, forged)));
+  }
+  assert.equal(store.envelopes.size, 1);
 });

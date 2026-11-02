@@ -52,6 +52,14 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
   are live, and requires zero approvals. It also gives a fraudster live
   stolen numbers, the merchants they're locked to and their own valid API
   key: they can't pose as the merchant, and the attempt burns the numbers.
+- **Customer-signed intent** (0.8). `create(input, owner, { signedIntent,
+  requireCustomerSignature })` creates a credential only from an approval the
+  customer signed on an enrolled device (native key: Ed25519 or post-quantum
+  Ed25519 + ML-DSA-65; web: passkey / Secure Payment Confirmation) for exactly
+  that payee, amount, currency, channel and expiry, used once. The approval is
+  embedded in the receipt as dispute evidence. Apps provide a `PayerKeyStore`
+  (enrolled public keys, spent nonces) that passes
+  `payerKeyStoreConformance`. Design: `docs/design/customer-signed-intent.md`.
 - **Callers authorize only as themselves** (0.7). `resolve(input,
   { callerMerchantId })` takes the merchant from the app's authentication
   (the API key's merchant, or the card network's verified merchant id), not
