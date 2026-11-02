@@ -49,9 +49,14 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
   the envelope's details and the HMAC secret when needed.
 - **Breach-tested.** `test/breach.test.ts` gives an attacker SPIN's whole
   database, every merchant's logs and 20,000 targeted guesses while envelopes
-  are live, and requires zero approvals. Its known limit: the database plus
-  the HMAC secret can recompute live numbers; a device-held split key is the
-  planned fix.
+  are live, and requires zero approvals.
+- **Keys can live in hardware** (0.6). Card numbers and their fingerprints
+  come from a `PanKeyring`. With `remotePanKeyring` (KMS/HSM), the breach test
+  shows the database plus every secret on the app server recomputes nothing;
+  an attacker can only ask the key service, which rate-limits and logs. With
+  the default `softwarePanKeyring` (the HMAC secret in the environment), the
+  database plus that secret can recompute live numbers: fine for the sandbox,
+  not for production.
 
 ### Behaviour changes from the per-app copies
 
@@ -186,6 +191,31 @@ export const drizzlePayEnvelopeStore: PayEnvelopeStore<string, string> = {
   // findById, insert, recordEvent: plain select / insert, mapping columns.
 };
 ```
+
+### Keeping the card-number keys in hardware
+
+`PayEnvelopeService` takes a `keyring`. Without one it uses
+`softwarePanKeyring(PAY_ENVELOPE_HMAC_SECRET)`, the same keys as 0.5. In
+production, keep the keys in a key service so they can't be copied off the
+server. AWS KMS, with two `HMAC_256` keys:
+
+```ts
+import { KMSClient, GenerateMacCommand } from "@aws-sdk/client-kms";
+import { PayEnvelopeService, remotePanKeyring } from "@spin/core";
+
+const kms = new KMSClient({});
+const keyId = { "pan-derive": "alias/spin-pan-derive", "pan-fingerprint": "alias/spin-pan-fingerprint" };
+const keyring = remotePanKeyring({
+  description: "aws-kms",
+  mac: async (purpose, data) =>
+    (await kms.send(new GenerateMacCommand({ KeyId: keyId[purpose], Message: data, MacAlgorithm: "HMAC_SHA_256" }))).Mac!,
+});
+const service = new PayEnvelopeService({ store, keyring }); // PAY_ENVELOPE_HMAC_SECRET no longer needed
+```
+
+A keyring error fails closed (`PayEnvelopeKeyringError`): no envelope is
+created and nothing is approved. Switching keyrings changes every number and
+fingerprint, so envelopes live at the switch stop working (an hour at most).
 
 Then prove it in the app's tests against a real Postgres (PGlite works):
 
