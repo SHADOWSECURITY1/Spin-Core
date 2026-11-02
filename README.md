@@ -262,3 +262,15 @@ npm run build   # dist/
 3. **v0.3:** Forward-secret messaging (ratchet + orchestration), shared by web and mobile
 4. Post-quantum suite registry, crypto inventory, device-key proofs
 5. One key-provider interface (env today, KMS/HSM later)
+
+## License
+
+[Business Source License 1.1](LICENSE). You can read, copy, modify and use
+Spin-Core, including in production, except to offer a competing service:
+one that issues, authorizes or validates payment credentials, or approves or
+co-signs payments or digital-asset transfers, for others. Each version becomes
+Apache-2.0 four years after its release. For other arrangements, email
+info@spinpay.ai.
+
+The approach is patent pending. This license grants no patent rights beyond
+the use it permits.
