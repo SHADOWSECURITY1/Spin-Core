@@ -40,6 +40,18 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
 - **Context binding is strict.** An envelope created for a channel requires the
   resolve request to state the same channel. Merchant, currency and amount
   (within tolerance) must match.
+- **A decline burns the envelope** (0.5). A number presented with the wrong
+  merchant, amount, currency or channel has leaked, so it never works again:
+  later attempts get `PREVIOUSLY_DECLINED`, and `claim` refuses declined
+  envelopes atomically.
+- **No card numbers at rest** (0.5). The store keeps a keyed fingerprint
+  (`presentationPanDigest`), never the number. The number is recomputed from
+  the envelope's details and the HMAC secret when needed.
+- **Breach-tested.** `test/breach.test.ts` gives an attacker SPIN's whole
+  database, every merchant's logs and 20,000 targeted guesses while envelopes
+  are live, and requires zero approvals. Its known limit: the database plus
+  the HMAC secret can recompute live numbers; a device-held split key is the
+  planned fix.
 
 ### Behaviour changes from the per-app copies
 
@@ -141,6 +153,7 @@ export const drizzlePayEnvelopeStore: PayEnvelopeStore<string, string> = {
         eq(payEnvelopes.id, id),
         isNull(payEnvelopes.usedAt),
         isNull(payEnvelopes.expiredAt),
+        isNull(payEnvelopes.decision), // a decline burns the envelope
         gt(payEnvelopes.expiresAt, now),
       ))
       .returning({ id: payEnvelopes.id });
@@ -158,9 +171,9 @@ export const drizzlePayEnvelopeStore: PayEnvelopeStore<string, string> = {
       .returning({ id: payEnvelopes.id });
     return rows.length === 1;
   },
-  async findByPan(pan) {
+  async findByPanDigest(digest) {
     const [row] = await db.select().from(payEnvelopes)
-      .where(eq(payEnvelopes.presentationPan, pan))
+      .where(eq(payEnvelopes.presentationPanDigest, digest))
       .orderBy(desc(payEnvelopes.createdAt)).limit(1);
     return row ? toRecord(row) : null;
   },

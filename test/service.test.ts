@@ -83,12 +83,33 @@ test("TTL is clamped to 10s..3600s", async () => {
 
 test("amount tolerance and context binding", async () => {
   const { service } = setup();
-  const env = await service.create({ ...ctx, amountTolerance: 0.05, channel: "CNP" }, ownerA);
-  const resolve = (txn: object) => service.resolve({ presentation: env.presentation, txnContext: { ...ctx, ...txn } });
-  assert.equal((await resolve({ amount: 5300, channel: "CNP" })).reasonCode, "AMOUNT_OUT_OF_BOUNDS");
-  assert.equal((await resolve({ currency: "EUR", channel: "CNP" })).reasonCode, "CONTEXT_MISMATCH");
-  assert.equal((await resolve({ amount: 5250 })).reasonCode, "CONTEXT_MISMATCH", "omitting channel bypassed the binding");
-  assert.equal((await resolve({ amount: 5250, channel: "CNP" })).decision, "APPROVE");
+  // Each check gets a fresh envelope: any decline burns the one it was made for.
+  const check = async (txn: object) => {
+    const env = await service.create({ ...ctx, amountTolerance: 0.05, channel: "CNP" }, ownerA);
+    return service.resolve({ presentation: env.presentation, txnContext: { ...ctx, ...txn } });
+  };
+  assert.equal((await check({ amount: 5300, channel: "CNP" })).reasonCode, "AMOUNT_OUT_OF_BOUNDS");
+  assert.equal((await check({ currency: "EUR", channel: "CNP" })).reasonCode, "CONTEXT_MISMATCH");
+  assert.equal((await check({ amount: 5250 })).reasonCode, "CONTEXT_MISMATCH", "omitting channel bypassed the binding");
+  assert.equal((await check({ amount: 5250, channel: "CNP" })).decision, "APPROVE");
+});
+
+test("a declined attempt burns the envelope: the right context afterwards is still declined", async () => {
+  const { service, store } = setup();
+  const env = await service.create({ ...ctx }, ownerA);
+  const wrong = await service.resolve({ presentation: env.presentation, txnContext: { ...ctx, merchantId: "m_evil" } });
+  assert.equal(wrong.reasonCode, "CONTEXT_MISMATCH");
+  const right = await service.resolve({ presentation: env.presentation, txnContext: ctx });
+  assert.equal(right.reasonCode, "PREVIOUSLY_DECLINED");
+  assert.equal(store.envelopes.get(env.envelopeId)!.usedAt, null);
+});
+
+test("idempotent retry returns the same card number, recomputed (it isn't stored)", async () => {
+  const { service, store } = setup();
+  const a = await service.create({ ...ctx, idempotencyKey: "order-7" }, ownerA);
+  const b = await service.create({ ...ctx, idempotencyKey: "order-7" }, ownerA);
+  assert.equal(b.presentation.pan, a.presentation.pan);
+  assert.ok(!JSON.stringify([...store.envelopes.values()]).includes(a.presentation.pan));
 });
 
 test("idempotency: same key and params returns the same envelope", async () => {
@@ -131,9 +152,10 @@ test("a PAN already in use is never reissued", async () => {
   const { service, store } = setup();
   const first = await service.create({ ...ctx }, ownerA);
   let lookups = 0;
-  const realFind = store.findByPan.bind(store);
+  const realFind = store.findByPanDigest.bind(store);
   // Pretend the first two candidate PANs collide with the existing envelope.
-  store.findByPan = async (pan: string) => (++lookups <= 2 ? store.envelopes.get(first.envelopeId)! : realFind(pan));
+  store.findByPanDigest = async (digest: string) =>
+    ++lookups <= 2 ? store.envelopes.get(first.envelopeId)! : realFind(digest);
   const second = await service.create({ ...ctx }, ownerA);
   assert.equal(lookups, 3);
   assert.notEqual(second.envelopeId, first.envelopeId);
