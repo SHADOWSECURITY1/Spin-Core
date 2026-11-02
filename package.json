@@ -3,7 +3,7 @@
   "version": "0.8.0",
   "description": "Shared SPIN security core: the Pay Envelope, and SPIN Vault's zero-knowledge file and post-quantum messaging crypto.",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "BUSL-1.1",
   "type": "module",
   "engines": {
     "node": ">=20"
