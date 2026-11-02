@@ -18,14 +18,15 @@ import type {
  * In SQL:
  *   UPDATE pay_envelopes
  *      SET used_at = $now, decision = 'APPROVE', audit_ref = $auditRef
- *    WHERE id = $id AND used_at IS NULL AND expired_at IS NULL AND expires_at > $now
+ *    WHERE id = $id AND used_at IS NULL AND expired_at IS NULL AND decision IS NULL
+ *      AND expires_at > $now
  *   RETURNING id
  */
 export interface PayEnvelopeStore<UserId = string, KeyId = string> {
   findById(id: string): Promise<PayEnvelopeRecord<UserId, KeyId> | null>;
 
-  /** Most recent envelope with this presentation PAN, if any. */
-  findByPan(pan: string): Promise<PayEnvelopeRecord<UserId, KeyId> | null>;
+  /** Most recent envelope with this card-number fingerprint, if any. */
+  findByPanDigest(digest: string): Promise<PayEnvelopeRecord<UserId, KeyId> | null>;
 
   /**
    * Idempotency keys are scoped to the API key that created the envelope.
@@ -40,8 +41,8 @@ export interface PayEnvelopeStore<UserId = string, KeyId = string> {
 
   /**
    * Atomically mark the envelope APPROVED. Only succeeds while it is unused,
-   * not manually expired, and `expiresAt > now`. Returns true iff this call
-   * changed the row.
+   * not declined (a decline burns it), not manually expired, and
+   * `expiresAt > now`. Returns true iff this call changed the row.
    */
   claim(id: string, now: Date, auditRef: string): Promise<boolean>;
 

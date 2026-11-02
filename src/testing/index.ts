@@ -54,7 +54,7 @@ export function payEnvelopeStoreConformance<UserId, KeyId>(
       currency: "USD",
       amountTolerancePpm: null,
       channel: null,
-      presentationPan: `4111119${String(seq).padStart(8, "0")}${seq % 10}`.slice(0, 16),
+      presentationPanDigest: `d1:${randomBytes(32).toString("hex")}`,
       createdAt: at(0),
       expiresAt: at(90),
       idempotencyKey: null,
@@ -76,7 +76,7 @@ export function payEnvelopeStoreConformance<UserId, KeyId>(
         await store.insert(e);
         for (const found of [
           await store.findById(e.id),
-          await store.findByPan(e.presentationPan),
+          await store.findByPanDigest(e.presentationPanDigest),
           await store.findByIdempotencyKey(ids.keyA, "idem-1"),
         ]) {
           assert.ok(found, "envelope not found");
@@ -90,7 +90,7 @@ export function payEnvelopeStoreConformance<UserId, KeyId>(
           assert.equal(found.decision, null);
         }
         assert.equal(await store.findById("env_missing"), null);
-        assert.equal(await store.findByPan("4000000000000002"), null);
+        assert.equal(await store.findByPanDigest(`d1:${"0".repeat(64)}`), null);
       }),
     },
     {
@@ -148,6 +148,18 @@ export function payEnvelopeStoreConformance<UserId, KeyId>(
         assert.equal(await store.markExpired(e.id, at(1)), true);
         assert.equal(await store.markExpired(e.id, at(2)), false, "expired twice");
         assert.equal(await store.claim(e.id, at(3), "aud"), false);
+      }),
+    },
+    {
+      name: "claim fails after markDeclined (a decline burns the envelope)",
+      run: withStore(async (store) => {
+        const e = envelope();
+        await store.insert(e);
+        await store.markDeclined(e.id, "CONTEXT_MISMATCH", "aud_bad");
+        assert.equal(await store.claim(e.id, at(1), "aud_ok"), false);
+        const after = await store.findById(e.id);
+        assert.equal(after?.decision, "DECLINE");
+        assert.equal(after?.usedAt, null);
       }),
     },
     {

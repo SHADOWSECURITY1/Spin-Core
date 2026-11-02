@@ -23,6 +23,9 @@ export const MAX_TTL_SECONDS = 3600;
 /** Visa test BIN. Replace with an issuer-owned range in production. */
 export const DEFAULT_BIN = "411111";
 const MAX_PAN_ATTEMPTS = 5;
+const PAN_DIGEST_INFO = "spin/pay-envelope/pan-digest/v1";
+/** Prefix of a stored card-number fingerprint (versioned). */
+export const PAN_DIGEST_PREFIX = "d1:";
 
 export class PayEnvelopeIdempotencyConflictError extends Error {
   constructor() {
@@ -54,6 +57,8 @@ const newAuditRef = () => `aud_${randomBytes(8).toString("base64url")}`;
 export class PayEnvelopeService<UserId = string, KeyId = string> {
   private readonly store: PayEnvelopeStore<UserId, KeyId>;
   private readonly secrets: PayEnvelopeSecrets;
+  /** Keys card-number fingerprints; derived from the HMAC secret, domain-separated. */
+  private readonly digestKey: Buffer;
   private readonly bin6: string;
   private readonly defaultTtlSeconds: number;
   private readonly now: () => Date;
@@ -62,6 +67,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
   constructor(opts: PayEnvelopeServiceOptions<UserId, KeyId>) {
     this.store = opts.store;
     this.secrets = opts.secrets ? assertValidSecrets(opts.secrets) : resolvePayEnvelopeSecrets();
+    this.digestKey = createHmac("sha256", this.secrets.hmac).update(PAN_DIGEST_INFO).digest();
     this.bin6 = opts.bin6 ?? DEFAULT_BIN;
     if (!/^\d{6}$/.test(this.bin6)) throw new Error("bin6 must be 6 digits");
     this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TTL_SECONDS;
@@ -95,7 +101,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
           existing.channel === (input.channel ?? null) &&
           existing.amountTolerancePpm === tolerancePpm;
         if (!same) throw new PayEnvelopeIdempotencyConflictError();
-        return toCreateOutput(existing);
+        return this.toCreateOutput(existing);
       }
     }
 
@@ -112,18 +118,20 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     // already in use (even by a spent envelope) is never reissued.
     let envelopeId = "";
     let pan = "";
+    let panDigest = "";
     for (let attempt = 0; ; attempt++) {
       if (attempt === MAX_PAN_ATTEMPTS) throw new Error("Could not allocate a unique presentation PAN");
       envelopeId = newEnvelopeId();
-      const digest = createHmac("sha256", this.secrets.hmac)
-        .update(
-          [envelopeId, createdAt.getTime(), input.merchantId, input.currency, input.amount, input.channel ?? ""].join("|"),
-        )
-        .digest("hex");
-      const body9 = digest.replace(/[a-f]/g, (c) => String(parseInt(c, 16) % 10)).slice(0, 9);
-      pan = projectPan(this.bin6, body9);
-      if (!isValidLuhn(pan)) throw new Error("PAN projection failed Luhn validation");
-      if (!(await this.store.findByPan(pan))) break;
+      pan = this.derivePan({
+        id: envelopeId,
+        createdAt,
+        merchantId: input.merchantId,
+        currency: input.currency,
+        amount: input.amount,
+        channel: input.channel ?? null,
+      });
+      panDigest = this.panDigest(pan);
+      if (!(await this.store.findByPanDigest(panDigest))) break;
     }
 
     const receiptJws = signReceipt(
@@ -148,7 +156,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
       currency: input.currency,
       amountTolerancePpm: tolerancePpm,
       channel: input.channel ?? null,
-      presentationPan: pan,
+      presentationPanDigest: panDigest, // never the card number itself
       createdAt,
       expiresAt,
       idempotencyKey: input.idempotencyKey ?? null,
@@ -172,7 +180,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
 
     if (!/^\d{16}$/.test(pan)) return { decision: "DECLINE", reasonCode: "INVALID_PRESENTATION", auditRef };
 
-    const envelope = await this.store.findByPan(pan);
+    const envelope = await this.store.findByPanDigest(this.panDigest(pan));
     if (!envelope) return { decision: "DECLINE", reasonCode: "UNKNOWN_PRESENTATION", auditRef };
 
     const plan = planResolution(envelope, input.txnContext, now);
@@ -234,6 +242,35 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     return envelope;
   }
 
+  /**
+   * The card number for an envelope: an HMAC of its id, creation time and
+   * context, projected into a Luhn-valid PAN under this service's BIN.
+   * Deterministic, so it is recomputed when needed instead of stored.
+   */
+  private derivePan(e: Pick<PayEnvelopeRecord<unknown, unknown>, "id" | "createdAt" | "merchantId" | "currency" | "amount" | "channel">): string {
+    const digest = createHmac("sha256", this.secrets.hmac)
+      .update([e.id, e.createdAt.getTime(), e.merchantId, e.currency, e.amount, e.channel ?? ""].join("|"))
+      .digest("hex");
+    const body9 = digest.replace(/[a-f]/g, (c) => String(parseInt(c, 16) % 10)).slice(0, 9);
+    const pan = projectPan(this.bin6, body9);
+    if (!isValidLuhn(pan)) throw new Error("PAN projection failed Luhn validation");
+    return pan;
+  }
+
+  /** What the store keeps instead of the card number. Useless without the HMAC secret. */
+  private panDigest(pan: string): string {
+    return PAN_DIGEST_PREFIX + createHmac("sha256", this.digestKey).update(pan).digest("hex");
+  }
+
+  private toCreateOutput(e: PayEnvelopeRecord<UserId, KeyId>): CreatePayEnvelopeOutput {
+    return {
+      envelopeId: e.id,
+      expiresAt: e.expiresAt.toISOString(),
+      presentation: { pan: this.derivePan(e) },
+      receiptJws: e.receiptJws ?? "",
+    };
+  }
+
   private emit(
     envelopeId: string,
     owner: EnvelopeOwner<UserId, KeyId>,
@@ -254,13 +291,4 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
       })
       .catch(this.onEventError);
   }
-}
-
-function toCreateOutput<U, K>(e: PayEnvelopeRecord<U, K>): CreatePayEnvelopeOutput {
-  return {
-    envelopeId: e.id,
-    expiresAt: e.expiresAt.toISOString(),
-    presentation: { pan: e.presentationPan },
-    receiptJws: e.receiptJws ?? "",
-  };
 }

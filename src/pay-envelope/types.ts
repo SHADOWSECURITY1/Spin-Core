@@ -14,7 +14,9 @@ export type PayEnvelopeDeclineReason =
   | "AMOUNT_OUT_OF_BOUNDS"
   | "UNKNOWN_PRESENTATION"
   | "INVALID_PRESENTATION"
-  | "ALREADY_EXPIRED";
+  | "ALREADY_EXPIRED"
+  /** An earlier attempt was declined, so the credential is burned: it leaked or was misused. */
+  | "PREVIOUSLY_DECLINED";
 
 export interface PayEnvelopeRecord<UserId = string, KeyId = string> {
   id: string;
@@ -28,7 +30,13 @@ export interface PayEnvelopeRecord<UserId = string, KeyId = string> {
   /** Allowed deviation from `amount`, in parts per million (50_000 = ±5%). Null = exact. */
   amountTolerancePpm: number | null;
   channel: string | null;
-  presentationPan: string;
+  /**
+   * Keyed fingerprint of the card number ("d1:" + hex HMAC), for lookups.
+   * The card number itself is never stored: it is recomputed from the
+   * envelope's details and the HMAC secret when needed, so a copy of the
+   * database contains no usable card numbers.
+   */
+  presentationPanDigest: string;
   createdAt: Date;
   expiresAt: Date;
   usedAt: Date | null;

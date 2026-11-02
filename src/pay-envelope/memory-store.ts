@@ -24,10 +24,10 @@ export class MemoryPayEnvelopeStore<UserId = string, KeyId = string>
     return e ? { ...e } : null;
   }
 
-  async findByPan(pan: string) {
+  async findByPanDigest(digest: string) {
     let latest: PayEnvelopeRecord<UserId, KeyId> | null = null;
     for (const e of this.envelopes.values()) {
-      if (e.presentationPan === pan && (!latest || e.createdAt >= latest.createdAt)) latest = e;
+      if (e.presentationPanDigest === digest && (!latest || e.createdAt >= latest.createdAt)) latest = e;
     }
     return latest ? { ...latest } : null;
   }
@@ -53,7 +53,7 @@ export class MemoryPayEnvelopeStore<UserId = string, KeyId = string>
 
   async claim(id: string, now: Date, auditRef: string) {
     const e = this.envelopes.get(id);
-    if (!e || e.usedAt || e.expiredAt || e.expiresAt.getTime() <= now.getTime()) return false;
+    if (!e || e.usedAt || e.expiredAt || e.decision || e.expiresAt.getTime() <= now.getTime()) return false;
     e.usedAt = now;
     e.decision = "APPROVE";
     e.declineReason = null;

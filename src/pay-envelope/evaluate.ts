@@ -40,6 +40,10 @@ export function planResolution<U, K>(
     return { action: "decline", reason: "EXPIRED", write: "expire" };
   }
   if (envelope.usedAt) return { action: "decline", reason: "REPLAY", write: "none" };
+  // A declined attempt means the number was presented somewhere it doesn't
+  // belong: it has leaked. It never works again (the store's claim enforces
+  // this atomically too).
+  if (envelope.decision === "DECLINE") return { action: "decline", reason: "PREVIOUSLY_DECLINED", write: "none" };
 
   if (txn.merchantId !== envelope.merchantId || txn.currency !== envelope.currency) {
     return { action: "decline", reason: "CONTEXT_MISMATCH", write: "decline" };
