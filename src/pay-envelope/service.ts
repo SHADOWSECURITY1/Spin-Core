@@ -181,17 +181,33 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     return { envelopeId, expiresAt: expiresAt.toISOString(), presentation: { pan }, receiptJws };
   }
 
-  async resolve(input: ResolvePayEnvelopeInput): Promise<ResolvePayEnvelopeOutput> {
+  /**
+   * The authorization step: approve this card number for this transaction?
+   *
+   * `callerMerchantId` is who is actually asking, as established by the app
+   * (the merchant that owns the authenticated API key, or later the card
+   * network's verified merchant id). When given, it replaces whatever merchant
+   * the request claims, so a caller can only ever authorize as itself: a
+   * fraudster who knows a stolen number and its merchant can't pose as that
+   * merchant. Apps that let callers resolve must pass it; without it the
+   * claimed merchant is trusted (only for callers that are the network).
+   */
+  async resolve(
+    input: ResolvePayEnvelopeInput,
+    opts: { callerMerchantId?: string } = {},
+  ): Promise<ResolvePayEnvelopeOutput> {
     const auditRef = newAuditRef();
     const now = this.now();
     const pan = input.presentation.pan;
+    const txnContext =
+      opts.callerMerchantId === undefined ? input.txnContext : { ...input.txnContext, merchantId: opts.callerMerchantId };
 
     if (!/^\d{16}$/.test(pan)) return { decision: "DECLINE", reasonCode: "INVALID_PRESENTATION", auditRef };
 
     const envelope = await this.store.findByPanDigest(await this.panDigest(pan));
     if (!envelope) return { decision: "DECLINE", reasonCode: "UNKNOWN_PRESENTATION", auditRef };
 
-    const plan = planResolution(envelope, input.txnContext, now);
+    const plan = planResolution(envelope, txnContext, now);
     if (plan.action === "decline") {
       if (plan.write === "expire") {
         if (await this.store.markExpired(envelope.id, now)) {
@@ -211,7 +227,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     }
     this.emit(envelope.id, envelope, "resolved", {
       decision: "APPROVE",
-      amount: input.txnContext.amount,
+      amount: txnContext.amount,
       auditRef,
     });
     return { decision: "APPROVE", auditRef };

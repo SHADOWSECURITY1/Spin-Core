@@ -94,6 +94,21 @@ test("amount tolerance and context binding", async () => {
   assert.equal((await check({ amount: 5250, channel: "CNP" })).decision, "APPROVE");
 });
 
+test("callerMerchantId: the authenticated caller's merchant replaces the claimed one", async () => {
+  const { service } = setup();
+  const env = await service.create({ ...ctx }, ownerA);
+  // Claims the right merchant, but is authenticated as another one.
+  const posing = await service.resolve({ presentation: env.presentation, txnContext: ctx }, { callerMerchantId: "m_other" });
+  assert.equal(posing.reasonCode, "CONTEXT_MISMATCH");
+  const env2 = await service.create({ ...ctx }, ownerA);
+  // The real merchant needn't even state its id correctly: who it is comes from authentication.
+  const real = await service.resolve(
+    { presentation: env2.presentation, txnContext: { ...ctx, merchantId: "ignored" } },
+    { callerMerchantId: ctx.merchantId },
+  );
+  assert.equal(real.decision, "APPROVE");
+});
+
 test("a declined attempt burns the envelope: the right context afterwards is still declined", async () => {
   const { service, store } = setup();
   const env = await service.create({ ...ctx }, ownerA);

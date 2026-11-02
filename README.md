@@ -49,7 +49,13 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
   the envelope's details and the HMAC secret when needed.
 - **Breach-tested.** `test/breach.test.ts` gives an attacker SPIN's whole
   database, every merchant's logs and 20,000 targeted guesses while envelopes
-  are live, and requires zero approvals.
+  are live, and requires zero approvals. It also gives a fraudster live
+  stolen numbers, the merchants they're locked to and their own valid API
+  key: they can't pose as the merchant, and the attempt burns the numbers.
+- **Callers authorize only as themselves** (0.7). `resolve(input,
+  { callerMerchantId })` takes the merchant from the app's authentication
+  (the API key's merchant, or the card network's verified merchant id), not
+  from the request. Apps that let API callers resolve must pass it.
 - **Keys can live in hardware** (0.6). Card numbers and their fingerprints
   come from a `PanKeyring`. With `remotePanKeyring` (KMS/HSM), the breach test
   shows the database plus every secret on the app server recomputes nothing;
