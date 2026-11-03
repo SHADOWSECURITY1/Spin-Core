@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { generateKeyPairSync, randomBytes, sign as nodeSign } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, sign as nodeSign } from "node:crypto";
 import { p256 } from "@noble/curves/nist.js";
 import {
   MemoryMandateStore,
@@ -15,6 +15,7 @@ import {
   PayEnvelopeIntentError,
   PayEnvelopeService,
   canonicalIntent,
+  enrollmentChallenge,
   intentChallenge,
   mandateChallenge,
   verifyReceipt,
@@ -91,6 +92,15 @@ test("an agent's P-256 key (DER or compact signatures) signs purchases that veri
   assert.equal(verifySignedIntent(bot.buy(i, "compact"), bot.key), true);
   assert.equal(verifySignedIntent({ ...bot.buy(i), keyId: "agent-1" }, other.key), false);
   assert.equal(verifySignedIntent({ ...bot.buy(i), intent: { ...i, amount: 4500 } }, bot.key), false, "the mandate id and amount are covered");
+});
+
+test("an approval to add an agent key can't be used to add it as a full device, and device enrollments keep their bytes", () => {
+  const e = { v: 1 as const, payerId: "alice", newKey: { keyId: "agent-1", scheme: "ecdsa-p256" as const, publicKey: "pk", role: "agent" as const }, expiresAt: new Date(Date.now() + 60_000).toISOString(), nonce: "enroll-0123456789abcdef" };
+  const { role: _r, ...asDevice } = e.newKey;
+  assert.notDeepEqual(enrollmentChallenge(e), enrollmentChallenge({ ...e, newKey: asDevice }));
+  const device = { ...e, newKey: { keyId: "phone-2", scheme: "ed25519" as const, publicKey: "pk" } };
+  const expected = new Uint8Array(createHash("sha256").update("spin/enroll-device/v1\n" + JSON.stringify([1, "alice", "phone-2", "ed25519", "pk", device.expiresAt, device.nonce]), "utf8").digest());
+  assert.deepEqual(enrollmentChallenge(device), expected);
 });
 
 test("intents without a mandate keep their original bytes, so existing approvals still verify", () => {

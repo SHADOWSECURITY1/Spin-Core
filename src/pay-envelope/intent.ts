@@ -279,8 +279,12 @@ export function verifySignedIntent(
 export interface DeviceEnrollment {
   v: 1;
   payerId: string;
-  /** The key being added. */
-  newKey: { keyId: string; scheme: IntentScheme; publicKey: string };
+  /**
+   * The key being added. `role: "agent"` adds an AI agent's key, which can
+   * only buy under a mandate; it is covered by the signature, so an approval
+   * to add an agent can't be used to add a full device.
+   */
+  newKey: { keyId: string; scheme: IntentScheme; publicKey: string; role?: "agent" };
   /** ISO 8601; at most an hour ahead. */
   expiresAt: string;
   /** Single use (shares the payer's nonce space with intents). */
@@ -290,7 +294,9 @@ export interface DeviceEnrollment {
 const ENROLL_PREFIX = "spin/enroll-device/v1\n";
 
 export function enrollmentChallenge(e: DeviceEnrollment): Uint8Array {
-  const canonical = JSON.stringify([e.v, e.payerId, e.newKey.keyId, e.newKey.scheme, e.newKey.publicKey, e.expiresAt, e.nonce]);
+  const base = [e.v, e.payerId, e.newKey.keyId, e.newKey.scheme, e.newKey.publicKey, e.expiresAt, e.nonce];
+  // Device enrollments keep their original bytes; an agent's adds its role.
+  const canonical = JSON.stringify(e.newKey.role === undefined ? base : [...base, e.newKey.role]);
   return new Uint8Array(createHash("sha256").update(ENROLL_PREFIX + canonical, "utf8").digest());
 }
 
@@ -302,8 +308,9 @@ export function isWellFormedEnrollment(e: unknown): e is DeviceEnrollment {
     x.v === 1 &&
     typeof x.payerId === "string" && x.payerId.length > 0 &&
     !!k && typeof k.keyId === "string" && k.keyId.length > 0 &&
-    (k.scheme === "ed25519" || k.scheme === "hybrid-ed25519-mldsa65" || k.scheme === "webauthn-es256") &&
+    (k.scheme === "ed25519" || k.scheme === "hybrid-ed25519-mldsa65" || k.scheme === "webauthn-es256" || k.scheme === "ecdsa-p256") &&
     typeof k.publicKey === "string" && k.publicKey.length > 0 &&
+    (k.role === undefined || k.role === "agent") &&
     typeof x.expiresAt === "string" && !Number.isNaN(Date.parse(x.expiresAt)) &&
     typeof x.nonce === "string" && x.nonce.length >= MIN_NONCE_LENGTH && x.nonce.length <= 128
   );

@@ -36,6 +36,9 @@ merchant or paying too much.
 - An agent key can only buy under a mandate. It can't sign a mandate (even
   for itself), and apps must not accept it for device enrollments or
   revocations.
+- Adding an agent key needs an enrollment approval with `newKey.role:
+  "agent"`, covered by the person's signature: an approval to add an agent
+  can't be replayed to add a full device.
 - A person's own device signs purchases without a mandate and may not claim one.
 - Revoking the device that signed a mandate revokes the mandate.
 - A mandate edited after signing fails its signature check on every purchase.
