@@ -40,10 +40,14 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
 - **Context binding is strict.** An envelope created for a channel requires the
   resolve request to state the same channel. Merchant, currency and amount
   (within tolerance) must match.
-- **A decline burns the envelope** (0.5). A number presented with the wrong
-  merchant, amount, currency or channel has leaked, so it never works again:
-  later attempts get `PREVIOUSLY_DECLINED`, and `claim` refuses declined
-  envelopes atomically.
+- **Misuse at its own merchant burns the envelope** (0.5; narrowed in 0.9).
+  A number presented by its own merchant with the wrong amount, currency or
+  channel never works again: later attempts get `PREVIOUSLY_DECLINED`, and
+  `claim` refuses declined envelopes atomically. **Another merchant**
+  presenting it is declined and reported (a `declined` event with
+  `burned: false` and `wrongMerchant`), but doesn't burn it: the number only
+  ever pays its own merchant, and burning let anyone with leaked numbers and
+  a merchant account destroy customers' payments.
 - **No card numbers at rest** (0.5). The store keeps a keyed fingerprint
   (`presentationPanDigest`), never the number. The number is recomputed from
   the envelope's details and the HMAC secret when needed.
@@ -51,7 +55,7 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
   database, every merchant's logs and 20,000 targeted guesses while envelopes
   are live, and requires zero approvals. It also gives a fraudster live
   stolen numbers, the merchants they're locked to and their own valid API
-  key: they can't pose as the merchant, and the attempt burns the numbers.
+  key: they can't pose as the merchant, and can't destroy the customers' payments.
 - **Customer-signed intent** (0.8). `create(input, owner, { signedIntent,
   requireCustomerSignature })` creates a credential only from an approval the
   customer signed on an enrolled device (native key: Ed25519 or post-quantum

@@ -109,14 +109,30 @@ test("callerMerchantId: the authenticated caller's merchant replaces the claimed
   assert.equal(real.decision, "APPROVE");
 });
 
-test("a declined attempt burns the envelope: the right context afterwards is still declined", async () => {
+test("another merchant presenting the number is declined and reported, but doesn't burn it", async () => {
   const { service, store } = setup();
   const env = await service.create({ ...ctx }, ownerA);
   const wrong = await service.resolve({ presentation: env.presentation, txnContext: { ...ctx, merchantId: "m_evil" } });
   assert.equal(wrong.reasonCode, "CONTEXT_MISMATCH");
+  const flagged = store.events.find((e) => e.envelopeId === env.envelopeId && e.eventType === "declined");
+  assert.equal(flagged?.eventData.burned, false);
+  assert.equal(flagged?.eventData.wrongMerchant, "m_evil");
+  // It still pays its own merchant, once: a griefer can't destroy customers' payments.
   const right = await service.resolve({ presentation: env.presentation, txnContext: ctx });
-  assert.equal(right.reasonCode, "PREVIOUSLY_DECLINED");
-  assert.equal(store.envelopes.get(env.envelopeId)!.usedAt, null);
+  assert.equal(right.decision, "APPROVE");
+  assert.equal((await service.resolve({ presentation: env.presentation, txnContext: ctx })).reasonCode, "REPLAY");
+});
+
+test("misuse at its own merchant burns the envelope: the right context afterwards is still declined", async () => {
+  const { service, store } = setup();
+  for (const bad of [{ amount: ctx.amount * 10 }, { currency: "EUR" }]) {
+    const env = await service.create({ ...ctx }, ownerA);
+    const wrong = await service.resolve({ presentation: env.presentation, txnContext: { ...ctx, ...bad } });
+    assert.equal(wrong.decision, "DECLINE");
+    const right = await service.resolve({ presentation: env.presentation, txnContext: ctx });
+    assert.equal(right.reasonCode, "PREVIOUSLY_DECLINED", JSON.stringify(bad));
+    assert.equal(store.envelopes.get(env.envelopeId)!.usedAt, null);
+  }
 });
 
 test("idempotent retry returns the same card number, recomputed (it isn't stored)", async () => {

@@ -181,7 +181,7 @@ test("breach: a number seen at the wrong merchant stays dead, even with the righ
   }
 });
 
-test("breach: stolen live numbers, their merchants, and the fraudster's own API key: they can't pose as the merchant", async () => {
+test("breach: stolen live numbers, their merchants, and the fraudster's own API key: they can't pose as the merchant, or destroy the payments", async () => {
   const { service, live } = await scenario();
   // Numbers stolen before use (e.g. from a compromised checkout page), with
   // every detail they're locked to. The fraudster has a valid SPIN account of
@@ -193,15 +193,14 @@ test("breach: stolen live numbers, their merchants, and the fraudster's own API 
     assert.notEqual(r.decision, "APPROVE", "a caller posed as another merchant");
     assert.equal(r.reasonCode, "CONTEXT_MISMATCH");
   }
-  // The attempt burned them: even the real merchant can't use them now.
-  for (const { pan, context } of stolen) {
-    const r = await service.resolve({ presentation: { pan }, txnContext: context }, { callerMerchantId: context.merchantId });
-    assert.equal(r.reasonCode, "PREVIOUSLY_DECLINED");
-  }
-  // Control: numbers nobody attacked work for their own merchant, once.
-  for (const { pan, context } of untouched) {
+  // The attempts didn't destroy the customers' payments: each stolen number
+  // still pays only its own merchant, the approved amount, once. (Burning on
+  // a wrong merchant would let a fraudster with leaked numbers grief them.)
+  for (const { pan, context } of [...stolen, ...untouched]) {
     const r = await service.resolve({ presentation: { pan }, txnContext: context }, { callerMerchantId: context.merchantId });
     assert.equal(r.decision, "APPROVE");
+    const again = await service.resolve({ presentation: { pan }, txnContext: context }, { callerMerchantId: context.merchantId });
+    assert.equal(again.reasonCode, "REPLAY");
   }
 });
 

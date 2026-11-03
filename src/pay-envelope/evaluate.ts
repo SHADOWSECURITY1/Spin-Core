@@ -9,8 +9,10 @@ export type ResolutionPlan =
   | { action: "decline"; reason: PayEnvelopeDeclineReason; write: "none" }
   /** Decline and record that the envelope has lapsed. */
   | { action: "decline"; reason: "EXPIRED"; write: "expire" }
-  /** Decline and record the decline on the envelope. */
+  /** Decline and record the decline on the envelope: it's burned. */
   | { action: "decline"; reason: PayEnvelopeDeclineReason; write: "decline" }
+  /** Decline and report the attempt, but don't burn: a wrong merchant presented it. */
+  | { action: "decline"; reason: "CONTEXT_MISMATCH"; write: "flag" }
   /** Every check passed: try to claim it atomically. */
   | { action: "claim" };
 
@@ -40,12 +42,20 @@ export function planResolution<U, K>(
     return { action: "decline", reason: "EXPIRED", write: "expire" };
   }
   if (envelope.usedAt) return { action: "decline", reason: "REPLAY", write: "none" };
-  // A declined attempt means the number was presented somewhere it doesn't
-  // belong: it has leaked. It never works again (the store's claim enforces
-  // this atomically too).
+  // A burned number (misused at its own merchant) never works again; the
+  // store's claim enforces this atomically too.
   if (envelope.decision === "DECLINE") return { action: "decline", reason: "PREVIOUSLY_DECLINED", write: "none" };
 
-  if (txn.merchantId !== envelope.merchantId || txn.currency !== envelope.currency) {
+  // Another merchant presenting the number is declined and reported, but
+  // doesn't burn it. Burning on a wrong merchant let anyone holding leaked
+  // numbers and a merchant account destroy customers' payments, while
+  // protecting nothing: the number only ever pays its own merchant.
+  if (txn.merchantId !== envelope.merchantId) {
+    return { action: "decline", reason: "CONTEXT_MISMATCH", write: "flag" };
+  }
+  // The right merchant with the wrong currency, channel or amount: the number
+  // is being misused where it does work, so it never works again.
+  if (txn.currency !== envelope.currency) {
     return { action: "decline", reason: "CONTEXT_MISMATCH", write: "decline" };
   }
   // An envelope bound to a channel requires the request to state the same
