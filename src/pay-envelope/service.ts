@@ -13,6 +13,9 @@ import {
   PayEnvelopeIntentError,
   isWellFormedIntent,
   verifySignedIntent,
+  verifySignedMandate,
+  checkPurchaseAgainstMandate,
+  type MandateStore,
   type PayerKeyStore,
   type SignedIntent,
   type WebAuthnPolicy,
@@ -67,6 +70,11 @@ export interface PayEnvelopeServiceOptions<UserId, KeyId> {
   /** Where passkey (webauthn-es256) approvals may come from. */
   webauthn?: WebAuthnPolicy;
   /**
+   * Standing rules for AI agents. Required to accept purchases signed by an
+   * agent key (docs/design/agent-mandates.md); without it they are refused.
+   */
+  mandates?: MandateStore;
+  /**
    * The verified name of a payee merchant, or null if unknown. When it gives a
    * name, a Secure Payment Confirmation approval must have shown exactly that
    * payee (the browser draws it, so a compromised page can't fake it).
@@ -98,6 +106,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
   private readonly keyring: PanKeyring;
   private readonly payerKeys: PayerKeyStore | undefined;
   private readonly webauthn: WebAuthnPolicy | undefined;
+  private readonly mandates: MandateStore | undefined;
   private readonly payeeName: PayEnvelopeServiceOptions<UserId, KeyId>["payeeName"];
   private readonly bin6: string;
   private readonly testBin6: string;
@@ -114,6 +123,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     this.keyring = opts.keyring ?? softwarePanKeyring(this.secrets.hmac);
     this.payerKeys = opts.payerKeys;
     this.webauthn = opts.webauthn;
+    this.mandates = opts.mandates;
     this.payeeName = opts.payeeName;
     this.bin6 = opts.bin6 ?? DEFAULT_BIN;
     if (!/^\d{6}$/.test(this.bin6)) throw new Error("bin6 must be 6 digits");
@@ -176,9 +186,27 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     if (!si && opts.requireCustomerSignature) {
       throw new PayEnvelopeIntentError("intent_required", "This API key requires a customer-signed intent.");
     }
+    let mandateReservation: string | null = null;
     if (si) {
-      expiresAt = await this.checkSignedIntent(si, input, tolerancePpm, createdAt, expiresAt);
+      ({ until: expiresAt, mandateReservation } = await this.checkSignedIntent(si, input, tolerancePpm, createdAt, expiresAt));
     }
+    try {
+      return await this.issue(input, owner, tolerancePpm, createdAt, expiresAt, si);
+    } catch (err) {
+      // Nothing was issued: give the mandate's 24-hour allowance back.
+      if (mandateReservation) await this.mandates!.releaseMandateSpend(mandateReservation).catch(() => {});
+      throw err;
+    }
+  }
+
+  private async issue(
+    input: CreatePayEnvelopeInput,
+    owner: EnvelopeOwner<UserId, KeyId>,
+    tolerancePpm: number | null,
+    createdAt: Date,
+    expiresAt: Date,
+    si: SignedIntent | undefined,
+  ): Promise<CreatePayEnvelopeOutput> {
 
     // The presentation PAN is derived from the envelope's context via HMAC,
     // so it can't be predicted without the secret. 9 digits of body means
@@ -356,7 +384,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     tolerancePpm: number | null,
     now: Date,
     expiresAt: Date,
-  ): Promise<Date> {
+  ): Promise<{ until: Date; mandateReservation: string | null }> {
     if (!this.payerKeys) {
       throw new PayEnvelopeIntentError("intent_invalid", "Customer-signed intents are not enabled on this server.");
     }
@@ -389,10 +417,53 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
       throw new PayEnvelopeIntentError("intent_invalid", "A customer approval may last at most an hour.");
     }
     const until = new Date(Math.min(expiresAt.getTime(), approvedUntil));
+    // An AI agent's key signs only under a person's mandate, and the mandate's
+    // 24-hour allowance is reserved before the approval is spent.
+    const mandateReservation = await this.checkMandate(si, key.role === "agent", now);
     if (!(await this.payerKeys.useNonce(intent.payerId, intent.nonce, new Date(approvedUntil)))) {
+      if (mandateReservation) await this.mandates!.releaseMandateSpend(mandateReservation).catch(() => {});
       throw new PayEnvelopeIntentError("intent_replayed", "This approval was already used.");
     }
-    return until;
+    return { until, mandateReservation };
+  }
+
+  /**
+   * For a purchase signed by an agent key: the mandate it names must exist,
+   * be unrevoked and unexpired, name this agent, still be signed by an active
+   * device of the same person, and allow this merchant, amount, currency and
+   * channel; then the amount is reserved against its 24-hour cap. A person's
+   * own device signs without a mandate, and may not name one.
+   */
+  private async checkMandate(si: SignedIntent, isAgent: boolean, now: Date): Promise<string | null> {
+    const intent = si.intent;
+    if (!isAgent) {
+      if (intent.mandateId !== undefined) {
+        throw new PayEnvelopeIntentError("intent_invalid", "Only an agent key signs under a mandate.");
+      }
+      return null;
+    }
+    if (intent.mandateId === undefined) {
+      throw new PayEnvelopeIntentError("mandate_required", "An agent's purchase must name the mandate it is made under.");
+    }
+    const invalid = new PayEnvelopeIntentError("mandate_invalid", "The mandate is unknown, revoked, expired or not for this agent.");
+    if (!this.mandates) throw invalid;
+    const stored = await this.mandates.findMandate(intent.payerId, intent.mandateId);
+    if (!stored || stored.revokedAt || stored.signed.mandate.agentKeyId !== si.keyId) throw invalid;
+    // The person who signed it must still have that device: revoking the
+    // device revokes what it granted.
+    const signer = await this.payerKeys!.findKey(intent.payerId, stored.signed.keyId);
+    if (!signer || signer.revokedAt || !verifySignedMandate(stored.signed, signer, this.webauthn)) throw invalid;
+    const violation = checkPurchaseAgainstMandate(intent, stored.signed.mandate, now);
+    if (violation === "mandate_expired") throw invalid;
+    if (violation) {
+      throw new PayEnvelopeIntentError("mandate_mismatch", "The purchase is outside the mandate (merchant, amount, currency or channel).");
+    }
+    const m = stored.signed.mandate;
+    const reservation = await this.mandates.reserveMandateSpend(m.nonce, intent.amount, new Date(now.getTime() - 86_400_000), m.maxPerDay);
+    if (!reservation) {
+      throw new PayEnvelopeIntentError("mandate_limit", "The purchase would exceed the mandate's 24-hour cap.");
+    }
+    return reservation;
   }
 
   /**

@@ -97,6 +97,18 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
 | Amount tolerance: SPIN-Envelope stored ‰, SPIN-Vault ppm, floating-point compare | ppm everywhere, exact integer compare |
 | A new PAN could collide with an existing one | Regenerated until unused |
 
+## AI agents: mandates (0.12)
+
+An agent's key (role `agent`, scheme `ecdsa-p256` for cloud key services)
+can create a card number only under a **mandate** its person signed once on
+their own device: which merchants, how much per purchase and per 24 hours,
+until when. Pass a `MandateStore` as `PayEnvelopeService`'s `mandates`
+option; every agent purchase is checked against the mandate and its 24-hour
+cap is reserved atomically. A hijacked agent can't leave its mandate
+(`test/agent.test.ts`). The approval kit adds `newMandate`,
+`describeMandate`, `approveMandate` and `newIntent({ mandateId })`. Design:
+`docs/design/agent-mandates.md`.
+
 ## Approval kit (`@spin/core/approval`)
 
 The customer's side of an approval, for browsers and React Native (no Node

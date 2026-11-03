@@ -25,14 +25,18 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import {
   CHALLENGE_PREFIX,
+  MANDATE_PREFIX,
   canonicalIntent,
+  canonicalMandate,
   fromMinorUnits,
   isWellFormedIntent,
+  isWellFormedMandate,
   minorUnitDigits,
   type CustomerIntent,
+  type Mandate,
 } from "../pay-envelope/intent-format.js";
 
-export type { CustomerIntent } from "../pay-envelope/intent-format.js";
+export type { CustomerIntent, Mandate } from "../pay-envelope/intent-format.js";
 
 /** What SPIN knows about the payee, from SPIN Pay's merchant lookup. */
 export interface PayeeProfile {
@@ -125,7 +129,10 @@ export function describeIntent(intent: CustomerIntent, payee: PayeeProfile, loca
   return { title: `Pay ${formatAmount(intent.amount, intent.currency, locale)} to ${payee.name}`, details, warnings };
 }
 
-/** A fresh intent for a payment, with a random nonce. Expires in 5 minutes by default. */
+/**
+ * A fresh intent for a payment, with a random nonce. Expires in 5 minutes by
+ * default. An AI agent passes the `mandateId` it buys under.
+ */
 export function newIntent(p: {
   payerId: string;
   merchantId: string;
@@ -134,6 +141,7 @@ export function newIntent(p: {
   channel?: "CNP" | "CP" | null;
   ttlSeconds?: number;
   now?: Date;
+  mandateId?: string;
 }): CustomerIntent {
   const nonce = new Uint8Array(16);
   globalThis.crypto.getRandomValues(nonce);
@@ -147,6 +155,88 @@ export function newIntent(p: {
     channel: p.channel ?? null,
     expiresAt: new Date(now.getTime() + (p.ttlSeconds ?? 300) * 1000).toISOString(),
     nonce: toBase64Url(nonce),
+    ...(p.mandateId !== undefined ? { mandateId: p.mandateId } : {}),
+  };
+}
+
+// ── Standing rules for AI agents (mandates) ──────────────────────────────────
+
+/** The 32 bytes a person's device signs to set a mandate (the same as the server's mandateChallenge). */
+export function mandateChallenge(m: Mandate): Uint8Array {
+  return sha256(utf8(MANDATE_PREFIX + canonicalMandate(m)));
+}
+
+/** A fresh mandate with a random id. Lasts 30 days by default (at most 90). */
+export function newMandate(p: {
+  payerId: string;
+  agentKeyId: string;
+  merchants: string[];
+  currency: string;
+  maxPerPurchase: number;
+  maxPerDay: number;
+  channel?: "CNP" | "CP" | null;
+  days?: number;
+  now?: Date;
+}): Mandate {
+  const nonce = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(nonce);
+  const now = p.now ?? new Date();
+  return {
+    v: 1,
+    payerId: p.payerId,
+    agentKeyId: p.agentKeyId,
+    merchants: [...p.merchants],
+    currency: p.currency,
+    maxPerPurchase: p.maxPerPurchase,
+    maxPerDay: p.maxPerDay,
+    channel: p.channel ?? null,
+    expiresAt: new Date(now.getTime() + Math.min(p.days ?? 30, 90) * 86_400_000).toISOString(),
+    nonce: toBase64Url(nonce),
+  };
+}
+
+/** What the person's approval screen shows for a mandate. Derived only from the mandate. */
+export function describeMandate(m: Mandate, opts: { agentName: string; merchantNames?: Record<string, string>; locale?: string }): ApprovalDescription {
+  const names = m.merchants.map((id) => opts.merchantNames?.[id] ?? id);
+  const until = new Date(m.expiresAt).toLocaleDateString(opts.locale, { year: "numeric", month: "long", day: "numeric" });
+  return {
+    title: `Let ${opts.agentName} spend up to ${formatAmount(m.maxPerDay, m.currency, opts.locale)} a day`,
+    details: [
+      `Up to ${formatAmount(m.maxPerPurchase, m.currency, opts.locale)} per purchase`,
+      `Only at: ${names.join(", ")}`,
+      m.channel === "CNP" ? "Online purchases only" : m.channel === "CP" ? "In-person purchases only" : "Online or in person",
+      `Until ${until}, unless you revoke it sooner`,
+    ],
+    warnings: [`${opts.agentName} can buy without asking you each time, within these limits.`],
+  };
+}
+
+/**
+ * Show a mandate and sign it, as one step (a person's own device; never the
+ * agent's key). Returns null if the person declines.
+ */
+export async function approveMandate(p: {
+  mandate: Mandate;
+  agentName: string;
+  merchantNames?: Record<string, string>;
+  keyId: string;
+  confirm: (description: ApprovalDescription) => Promise<boolean>;
+  sign: (challenge: Uint8Array) => Promise<Uint8Array | { signature: Uint8Array; authenticatorData?: Uint8Array; clientDataJSON?: Uint8Array }>;
+  locale?: string;
+}): Promise<{ mandate: Mandate; keyId: string; signature: string; authenticatorData?: string; clientDataJSON?: string } | null> {
+  if (!isWellFormedMandate(p.mandate)) throw new Error("Malformed mandate");
+  if (p.keyId === p.mandate.agentKeyId) throw new Error("A mandate is signed by a person's device, not the agent's key");
+  const mandate = Object.freeze({ ...p.mandate, merchants: Object.freeze([...p.mandate.merchants]) as string[] });
+  const description = describeMandate(mandate, { agentName: p.agentName, merchantNames: p.merchantNames, locale: p.locale });
+  if (!(await p.confirm(description))) return null;
+  const out = await p.sign(mandateChallenge(mandate));
+  if (out instanceof Uint8Array) return { mandate, keyId: p.keyId, signature: toBase64Url(out) };
+  return {
+    mandate,
+    keyId: p.keyId,
+    signature: toBase64Url(out.signature),
+    ...(out.authenticatorData ? { authenticatorData: toBase64Url(out.authenticatorData) } : {}),
+    ...(out.clientDataJSON ? { clientDataJSON: toBase64Url(out.clientDataJSON) } : {}),
   };
 }
 

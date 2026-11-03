@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import type { PayEnvelopeStore } from "../pay-envelope/store.js";
 import type { NewPayEnvelope } from "../pay-envelope/types.js";
-import type { PayerKey, PayerKeyStore } from "../pay-envelope/intent.js";
+import type { MandateStore, PayerKey, PayerKeyStore, SignedMandate } from "../pay-envelope/intent.js";
 
 export interface ConformanceOptions<UserId, KeyId> {
   /** Return a store over an empty or isolated dataset. Called once per case. */
@@ -242,6 +242,16 @@ export function payerKeyStoreConformance(opts: {
       },
     },
     {
+      name: "payer keys: an agent key keeps its role",
+      run: async () => {
+        const store = await opts.makeStore();
+        await opts.addKey(store, { ...key("alice", "agent-1"), role: "agent" });
+        await opts.addKey(store, key("alice", "phone-1"));
+        assert.equal((await store.findKey("alice", "agent-1"))?.role, "agent");
+        assert.notEqual((await store.findKey("alice", "phone-1"))?.role, "agent", "a person's device is never an agent");
+      },
+    },
+    {
       name: "payer keys: revocation is visible",
       run: async () => {
         const store = await opts.makeStore();
@@ -267,6 +277,78 @@ export function payerKeyStoreConformance(opts: {
           Array.from({ length: 8 }, () => store.useNonce("alice", "n-race-0123456789", later())),
         );
         assert.equal(results.filter(Boolean).length, 1);
+      },
+    },
+  ];
+}
+
+/**
+ * Conformance suite for MandateStore implementations (standing rules for AI
+ * agents). Above all, `reserveMandateSpend` must be atomic per mandate: the
+ * concurrency case fails for any store that reads the total and then writes.
+ */
+export function mandateStoreConformance(opts: {
+  makeStore: () => Promise<MandateStore> | MandateStore;
+  addMandate: (store: MandateStore, signed: SignedMandate) => Promise<void>;
+  revokeMandate: (store: MandateStore, payerId: string, mandateId: string, at: Date) => Promise<void>;
+}): ConformanceCase[] {
+  const signed = (payerId: string, nonce: string): SignedMandate => ({
+    mandate: {
+      v: 1,
+      payerId,
+      agentKeyId: "agent-1",
+      merchants: ["coffee-co", "books-co"],
+      currency: "USD",
+      maxPerPurchase: 2_000,
+      maxPerDay: 5_000,
+      channel: "CNP",
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+      nonce,
+    },
+    keyId: "phone-1",
+    signature: randomBytes(64).toString("base64url"),
+  });
+  const dayAgo = () => new Date(Date.now() - 86_400_000);
+  return [
+    {
+      name: "mandates: stored exactly, found by payer and id, and only there",
+      run: async () => {
+        const store = await opts.makeStore();
+        const m = signed("alice", "mandate-0123456789ab");
+        await opts.addMandate(store, m);
+        const found = await store.findMandate("alice", "mandate-0123456789ab");
+        assert.deepEqual(found?.signed, m);
+        assert.equal(found?.revokedAt, null);
+        assert.equal(await store.findMandate("bob", "mandate-0123456789ab"), null, "another payer's mandate id");
+      },
+    },
+    {
+      name: "mandates: revocation is visible",
+      run: async () => {
+        const store = await opts.makeStore();
+        await opts.addMandate(store, signed("alice", "mandate-revoke-01234"));
+        await opts.revokeMandate(store, "alice", "mandate-revoke-01234", new Date());
+        assert.ok((await store.findMandate("alice", "mandate-revoke-01234"))?.revokedAt instanceof Date);
+      },
+    },
+    {
+      name: "mandates: spending is reserved up to the cap, per mandate, and a release gives it back",
+      run: async () => {
+        const store = await opts.makeStore();
+        const a = await store.reserveMandateSpend("m-a", 3_000, dayAgo(), 5_000);
+        assert.ok(a);
+        assert.equal(await store.reserveMandateSpend("m-a", 2_001, dayAgo(), 5_000), null);
+        assert.ok(await store.reserveMandateSpend("m-b", 5_000, dayAgo(), 5_000), "another mandate has its own cap");
+        await store.releaseMandateSpend(a!);
+        assert.ok(await store.reserveMandateSpend("m-a", 5_000, dayAgo(), 5_000));
+      },
+    },
+    {
+      name: "mandates: 20 concurrent reservations never exceed the cap",
+      run: async () => {
+        const store = await opts.makeStore();
+        const results = await Promise.all(Array.from({ length: 20 }, () => store.reserveMandateSpend("m-race", 1_000, dayAgo(), 5_000)));
+        assert.equal(results.filter(Boolean).length, 5);
       },
     },
   ];
