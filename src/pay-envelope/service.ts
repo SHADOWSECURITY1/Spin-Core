@@ -255,7 +255,15 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
         }
       } else if (plan.write === "decline") {
         await this.store.markDeclined(envelope.id, plan.reason, auditRef);
-        this.emit(envelope.id, envelope, "declined", { reason: plan.reason, auditRef });
+        this.emit(envelope.id, envelope, "declined", { reason: plan.reason, auditRef, burned: true });
+      } else if (plan.write === "flag") {
+        // Reported to the envelope's owner, who can expire it if they choose.
+        this.emit(envelope.id, envelope, "declined", {
+          reason: plan.reason,
+          auditRef,
+          burned: false,
+          wrongMerchant: txnContext.merchantId,
+        });
       }
       return { decision: "DECLINE", reasonCode: plan.reason, auditRef };
     }

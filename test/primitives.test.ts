@@ -95,6 +95,10 @@ test("an envelope bound to a channel requires the request to state it", () => {
   } as unknown as PayEnvelopeRecord;
   const txn = { merchantId: "m", currency: "USD", amount: 100 };
   assert.deepEqual(planResolution(env, txn, now), { action: "decline", reason: "CONTEXT_MISMATCH", write: "decline" });
+  // Another merchant: declined and reported, not burned.
+  assert.deepEqual(planResolution(env, { ...txn, merchantId: "other", channel: "CNP" }, now), { action: "decline", reason: "CONTEXT_MISMATCH", write: "flag" });
+  assert.deepEqual(planResolution(env, { ...txn, currency: "EUR", channel: "CNP" }, now), { action: "decline", reason: "CONTEXT_MISMATCH", write: "decline" });
+  assert.deepEqual(planResolution(env, { ...txn, amount: 101, channel: "CNP" }, now), { action: "decline", reason: "AMOUNT_OUT_OF_BOUNDS", write: "decline" });
   assert.deepEqual(planResolution(env, { ...txn, channel: "CP" }, now).action, "decline");
   assert.deepEqual(planResolution(env, { ...txn, channel: "CNP" }, now), { action: "claim" });
 });

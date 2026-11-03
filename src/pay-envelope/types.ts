@@ -15,7 +15,7 @@ export type PayEnvelopeDeclineReason =
   | "UNKNOWN_PRESENTATION"
   | "INVALID_PRESENTATION"
   | "ALREADY_EXPIRED"
-  /** An earlier attempt was declined, so the credential is burned: it leaked or was misused. */
+  /** Burned: an earlier attempt at its own merchant had the wrong amount, currency or channel. */
   | "PREVIOUSLY_DECLINED";
 
 export interface PayEnvelopeRecord<UserId = string, KeyId = string> {
