@@ -59,6 +59,12 @@ export interface PayEnvelopeServiceOptions<UserId, KeyId> {
   payerKeys?: PayerKeyStore;
   /** Where passkey (webauthn-es256) approvals may come from. */
   webauthn?: WebAuthnPolicy;
+  /**
+   * The verified name of a payee merchant, or null if unknown. When it gives a
+   * name, a Secure Payment Confirmation approval must have shown exactly that
+   * payee (the browser draws it, so a compromised page can't fake it).
+   */
+  payeeName?: (merchantId: string) => Promise<string | null> | string | null;
   bin6?: string;
   defaultTtlSeconds?: number;
   /** Injectable clock for tests. */
@@ -81,6 +87,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
   private readonly keyring: PanKeyring;
   private readonly payerKeys: PayerKeyStore | undefined;
   private readonly webauthn: WebAuthnPolicy | undefined;
+  private readonly payeeName: PayEnvelopeServiceOptions<UserId, KeyId>["payeeName"];
   private readonly bin6: string;
   private readonly defaultTtlSeconds: number;
   private readonly now: () => Date;
@@ -95,6 +102,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     this.keyring = opts.keyring ?? softwarePanKeyring(this.secrets.hmac);
     this.payerKeys = opts.payerKeys;
     this.webauthn = opts.webauthn;
+    this.payeeName = opts.payeeName;
     this.bin6 = opts.bin6 ?? DEFAULT_BIN;
     if (!/^\d{6}$/.test(this.bin6)) throw new Error("bin6 must be 6 digits");
     this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TTL_SECONDS;
@@ -334,7 +342,8 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     }
     const intent = si.intent;
     const key = await this.payerKeys.findKey(intent.payerId, si.keyId);
-    if (!key || key.revokedAt || !verifySignedIntent(si, key, this.webauthn)) {
+    const payeeName = (await this.payeeName?.(intent.merchantId)) ?? undefined;
+    if (!key || key.revokedAt || !verifySignedIntent(si, key, this.webauthn, { payeeName })) {
       throw new PayEnvelopeIntentError("intent_invalid", "The customer's signature is not valid for an enrolled device.");
     }
     if (

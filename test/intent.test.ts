@@ -78,6 +78,33 @@ test("Secure Payment Confirmation: the total the browser showed must be the appr
   assert.equal(verifySignedIntent(d.signWith(i, { type: "payment.get" }), d.key, RP), false, "no total shown");
 });
 
+test("Secure Payment Confirmation: the payee the browser showed must be the merchant's verified name", async () => {
+  const d = passkeyDevice("alice");
+  const i = intentFor("alice");
+  const shown = (payeeName?: string) => d.signWith(i, { type: "payment.get", total: { currency: "USD", value: "4.50" }, payeeName });
+  assert.equal(verifySignedIntent(shown("Coffee Co."), d.key, RP, { payeeName: "Coffee Co." }), true);
+  assert.equal(verifySignedIntent(shown("Coffee Co"), d.key, RP, { payeeName: "Coffee Co." }), false);
+  assert.equal(verifySignedIntent(shown(), d.key, RP, { payeeName: "Coffee Co." }), false, "no payee shown");
+  // A plain passkey assertion has no browser-drawn payee to check.
+  assert.equal(verifySignedIntent(d.sign(i), d.key, RP, { payeeName: "Coffee Co." }), true);
+
+  // Through the service: payeeName looks up the merchant's verified name.
+  const payerKeys = new MemoryPayerKeyStore();
+  payerKeys.add(d.key);
+  const service = new PayEnvelopeService({
+    store: new MemoryPayEnvelopeStore(),
+    secrets: { hmac: "h".repeat(64), jws: "j".repeat(64) },
+    payerKeys,
+    webauthn: RP,
+    payeeName: (m) => (m === "coffee-co" ? "Coffee Co." : null),
+  });
+  const create = (si: ReturnType<typeof shown>) =>
+    service.create({ merchantId: "coffee-co", amount: 450, currency: "USD", channel: "CNP" }, { userId: "u", payKeyId: "k" }, { signedIntent: si, requireCustomerSignature: true });
+  await assert.rejects(create(d.signWith(intentFor("alice"), { type: "payment.get", total: { currency: "USD", value: "4.50" }, payeeName: "Thief's Shop" })), PayEnvelopeIntentError);
+  const ok = await create(d.signWith(intentFor("alice"), { type: "payment.get", total: { currency: "USD", value: "4.50" }, payeeName: "Coffee Co." }));
+  assert.match(ok.presentation.pan, /^\d{16}$/);
+});
+
 test("enrollment helper: a browser's SPKI passkey key converts to the stored form", () => {
   const { publicKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
   const spki = publicKey.export({ type: "spki", format: "der" });
