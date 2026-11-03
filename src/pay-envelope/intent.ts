@@ -1,10 +1,31 @@
 import { createHash, createPublicKey, verify as nodeVerify } from "node:crypto";
 import { p256 } from "@noble/curves/nist.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
-import { CHALLENGE_PREFIX, MIN_NONCE_LENGTH, canonicalIntent, isWellFormedIntent, toMinorUnits, type CustomerIntent } from "./intent-format.js";
+import {
+  CHALLENGE_PREFIX,
+  MANDATE_PREFIX,
+  MIN_NONCE_LENGTH,
+  canonicalIntent,
+  canonicalMandate,
+  isWellFormedIntent,
+  isWellFormedMandate,
+  toMinorUnits,
+  type CustomerIntent,
+  type Mandate,
+} from "./intent-format.js";
 
-export { canonicalIntent, isWellFormedIntent, minorUnitDigits, toMinorUnits, fromMinorUnits } from "./intent-format.js";
-export type { CustomerIntent } from "./intent-format.js";
+export {
+  canonicalIntent,
+  isWellFormedIntent,
+  minorUnitDigits,
+  toMinorUnits,
+  fromMinorUnits,
+  canonicalMandate,
+  isWellFormedMandate,
+  checkPurchaseAgainstMandate,
+  MAX_MANDATE_MERCHANTS,
+} from "./intent-format.js";
+export type { CustomerIntent, Mandate, MandateViolation } from "./intent-format.js";
 
 /**
  * Customer-signed intent (docs/design/customer-signed-intent.md).
@@ -27,7 +48,13 @@ export type { CustomerIntent } from "./intent-format.js";
  *                             challenge in clientDataJSON, user verification required
  */
 
-export type IntentScheme = "ed25519" | "hybrid-ed25519-mldsa65" | "webauthn-es256";
+/**
+ * "ecdsa-p256": a plain P-256 ECDSA key over SHA-256, as cloud key services
+ * (AWS KMS ECC_NIST_P256, Google Cloud KMS, Azure Key Vault) and HSMs sign:
+ * for AI agents, whose keys belong in hardware, not in the agent. Public key:
+ * the raw 65-byte point (base64url); signature: DER or 64-byte compact.
+ */
+export type IntentScheme = "ed25519" | "hybrid-ed25519-mldsa65" | "webauthn-es256" | "ecdsa-p256";
 
 export interface SignedIntent {
   intent: CustomerIntent;
@@ -48,6 +75,12 @@ export interface PayerKey {
   /** base64url; format per scheme (see above). */
   publicKey: string;
   revokedAt: Date | null;
+  /**
+   * "agent": an AI agent's key. It may sign purchases only under a mandate a
+   * person signed, and never mandates, enrollments or anything else.
+   * Absent = "device", a person's own device.
+   */
+  role?: "device" | "agent";
 }
 
 /**
@@ -75,7 +108,15 @@ export type IntentRejection =
   | "intent_invalid"
   | "intent_mismatch"
   | "intent_expired"
-  | "intent_replayed";
+  | "intent_replayed"
+  /** An agent key signed without naming a mandate. */
+  | "mandate_required"
+  /** The mandate is unknown, revoked, expired, for another agent, or its signer is gone. */
+  | "mandate_invalid"
+  /** The purchase is outside the mandate: merchant, amount, currency or channel. */
+  | "mandate_mismatch"
+  /** The purchase would exceed the mandate's 24-hour cap. */
+  | "mandate_limit";
 
 export class PayEnvelopeIntentError extends Error {
   constructor(
@@ -191,6 +232,11 @@ export function verifyKeySignature(
       }
       case "webauthn-es256":
         return verifyWebAuthn(proof, key, challenge, webauthn, spc);
+      case "ecdsa-p256": {
+        const sig = b64u(proof.signature);
+        // Hardware signers may emit high-S signatures, so lowS is relaxed.
+        return p256.verify(sig, challenge, b64u(key.publicKey), { format: sig.length === 64 ? "compact" : "der", lowS: false });
+      }
       default:
         return false;
     }
@@ -233,8 +279,12 @@ export function verifySignedIntent(
 export interface DeviceEnrollment {
   v: 1;
   payerId: string;
-  /** The key being added. */
-  newKey: { keyId: string; scheme: IntentScheme; publicKey: string };
+  /**
+   * The key being added. `role: "agent"` adds an AI agent's key, which can
+   * only buy under a mandate; it is covered by the signature, so an approval
+   * to add an agent can't be used to add a full device.
+   */
+  newKey: { keyId: string; scheme: IntentScheme; publicKey: string; role?: "agent" };
   /** ISO 8601; at most an hour ahead. */
   expiresAt: string;
   /** Single use (shares the payer's nonce space with intents). */
@@ -244,7 +294,9 @@ export interface DeviceEnrollment {
 const ENROLL_PREFIX = "spin/enroll-device/v1\n";
 
 export function enrollmentChallenge(e: DeviceEnrollment): Uint8Array {
-  const canonical = JSON.stringify([e.v, e.payerId, e.newKey.keyId, e.newKey.scheme, e.newKey.publicKey, e.expiresAt, e.nonce]);
+  const base = [e.v, e.payerId, e.newKey.keyId, e.newKey.scheme, e.newKey.publicKey, e.expiresAt, e.nonce];
+  // Device enrollments keep their original bytes; an agent's adds its role.
+  const canonical = JSON.stringify(e.newKey.role === undefined ? base : [...base, e.newKey.role]);
   return new Uint8Array(createHash("sha256").update(ENROLL_PREFIX + canonical, "utf8").digest());
 }
 
@@ -256,8 +308,9 @@ export function isWellFormedEnrollment(e: unknown): e is DeviceEnrollment {
     x.v === 1 &&
     typeof x.payerId === "string" && x.payerId.length > 0 &&
     !!k && typeof k.keyId === "string" && k.keyId.length > 0 &&
-    (k.scheme === "ed25519" || k.scheme === "hybrid-ed25519-mldsa65" || k.scheme === "webauthn-es256") &&
+    (k.scheme === "ed25519" || k.scheme === "hybrid-ed25519-mldsa65" || k.scheme === "webauthn-es256" || k.scheme === "ecdsa-p256") &&
     typeof k.publicKey === "string" && k.publicKey.length > 0 &&
+    (k.role === undefined || k.role === "agent") &&
     typeof x.expiresAt === "string" && !Number.isNaN(Date.parse(x.expiresAt)) &&
     typeof x.nonce === "string" && x.nonce.length >= MIN_NONCE_LENGTH && x.nonce.length <= 128
   );
@@ -279,6 +332,91 @@ export function p256PublicKeyFromSpki(spki: Uint8Array): string | null {
 }
 
 /** In-process store for tests and local tooling. */
+// ── Standing rules for AI agents (mandates) ──────────────────────────────────
+
+/** What a person's device signs to set a mandate (or passes as the WebAuthn challenge). */
+export function mandateChallenge(m: Mandate): Uint8Array {
+  return new Uint8Array(createHash("sha256").update(MANDATE_PREFIX + canonicalMandate(m), "utf8").digest());
+}
+
+export interface SignedMandate {
+  mandate: Mandate;
+  /** The person's enrolled device key (never an agent key) that signed it. */
+  keyId: string;
+  signature: string;
+  authenticatorData?: string;
+  clientDataJSON?: string;
+}
+
+/**
+ * True iff `sm` is a well-formed mandate signed by `key`, a person's device
+ * of the same payer: an agent key can never grant itself or another agent a
+ * mandate. Never throws. Does not check revocation or expiry.
+ */
+export function verifySignedMandate(sm: SignedMandate, key: PayerKey, webauthn?: WebAuthnPolicy): boolean {
+  try {
+    if (!isWellFormedMandate(sm.mandate) || sm.mandate.payerId !== key.payerId) return false;
+    if (key.role === "agent" || sm.keyId !== key.keyId || sm.keyId === sm.mandate.agentKeyId) return false;
+    return verifyKeySignature(key, mandateChallenge(sm.mandate), sm, webauthn);
+  } catch {
+    return false;
+  }
+}
+
+export interface StoredMandate {
+  signed: SignedMandate;
+  revokedAt: Date | null;
+}
+
+/**
+ * Mandates and their spending. Apps implement this over their own tables.
+ * `reserveMandateSpend` MUST be atomic per mandate (e.g. a transaction holding
+ * a lock on the mandate): parallel purchases must not all slip under the cap.
+ */
+export interface MandateStore {
+  findMandate(payerId: string, mandateId: string): Promise<StoredMandate | null>;
+  /** If spending since `since` plus `amount` stays within `limit`, record it and return its id; otherwise null. */
+  reserveMandateSpend(mandateId: string, amount: number, since: Date, limit: number): Promise<string | null>;
+  /** Undo a reservation whose credential wasn't created. */
+  releaseMandateSpend(reservationId: string): Promise<void>;
+}
+
+/** In-memory MandateStore for tests and demos. */
+export class MemoryMandateStore implements MandateStore {
+  readonly mandates = new Map<string, StoredMandate>();
+  readonly spend: { id: string; mandateId: string; amount: number; at: Date }[] = [];
+  private n = 0;
+  constructor(private readonly clock: () => Date = () => new Date()) {}
+
+  add(signed: SignedMandate): void {
+    this.mandates.set(`${signed.mandate.payerId}\u0000${signed.mandate.nonce}`, { signed, revokedAt: null });
+  }
+
+  revoke(payerId: string, mandateId: string, at = new Date()): void {
+    const m = this.mandates.get(`${payerId}\u0000${mandateId}`);
+    if (m) m.revokedAt = at;
+  }
+
+  async findMandate(payerId: string, mandateId: string) {
+    const m = this.mandates.get(`${payerId}\u0000${mandateId}`);
+    return m ? { signed: m.signed, revokedAt: m.revokedAt } : null;
+  }
+
+  // Check and record with no await in between: atomic.
+  async reserveMandateSpend(mandateId: string, amount: number, since: Date, limit: number) {
+    const total = this.spend.filter((x) => x.mandateId === mandateId && x.at >= since).reduce((a, x) => a + x.amount, 0);
+    if (total + amount > limit) return null;
+    const id = `res_${++this.n}`;
+    this.spend.push({ id, mandateId, amount, at: this.clock() });
+    return id;
+  }
+
+  async releaseMandateSpend(reservationId: string) {
+    const i = this.spend.findIndex((x) => x.id === reservationId);
+    if (i >= 0) this.spend.splice(i, 1);
+  }
+}
+
 export class MemoryPayerKeyStore implements PayerKeyStore {
   readonly keys = new Map<string, PayerKey>();
   readonly spent = new Map<string, Date>();
