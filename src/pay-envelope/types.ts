@@ -47,7 +47,15 @@ export interface PayEnvelopeRecord<UserId = string, KeyId = string> {
   idempotencyKey: string | null;
   receiptJws: string | null;
   metadata: Record<string, unknown> | null;
+  /**
+   * Whether a test or live API key created it. Only keys of the same
+   * environment can authorize it, and test card numbers use a separate
+   * prefix. Optional for stores that predate 0.11; null = unknown.
+   */
+  environment?: PayEnvelopeEnvironment | null;
 }
+
+export type PayEnvelopeEnvironment = "test" | "live";
 
 export type NewPayEnvelope<UserId = string, KeyId = string> = Omit<
   PayEnvelopeRecord<UserId, KeyId>,

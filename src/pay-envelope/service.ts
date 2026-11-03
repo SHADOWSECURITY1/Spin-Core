@@ -20,6 +20,7 @@ import {
 import type {
   CreatePayEnvelopeInput,
   CreatePayEnvelopeOutput,
+  PayEnvelopeEnvironment,
   PayEnvelopeEventType,
   PayEnvelopeRecord,
   ResolvePayEnvelopeInput,
@@ -31,6 +32,12 @@ export const MIN_TTL_SECONDS = 10;
 export const MAX_TTL_SECONDS = 3600;
 /** Visa test BIN. Replace with an issuer-owned range in production. */
 export const DEFAULT_BIN = "411111";
+/**
+ * Card numbers made by test keys start with this instead, so a test number
+ * can never be routed as a real card: no card network assigns prefixes
+ * starting with 9 to payment cards (ISO/IEC 7812 "national use").
+ */
+export const DEFAULT_TEST_BIN = "999999";
 const MAX_PAN_ATTEMPTS = 5;
 /** Prefix of a stored card-number fingerprint (versioned). */
 export const PAN_DIGEST_PREFIX = "d1:";
@@ -66,6 +73,8 @@ export interface PayEnvelopeServiceOptions<UserId, KeyId> {
    */
   payeeName?: (merchantId: string) => Promise<string | null> | string | null;
   bin6?: string;
+  /** Prefix for card numbers made by test keys (default DEFAULT_TEST_BIN). */
+  testBin6?: string;
   defaultTtlSeconds?: number;
   /** Injectable clock for tests. */
   now?: () => Date;
@@ -76,6 +85,8 @@ export interface PayEnvelopeServiceOptions<UserId, KeyId> {
 export interface EnvelopeOwner<UserId, KeyId> {
   userId: UserId;
   payKeyId: KeyId;
+  /** The creating key's environment. Test and live envelopes never authorize across environments. */
+  environment?: PayEnvelopeEnvironment | null;
 }
 
 const newEnvelopeId = () => `env_${randomBytes(12).toString("base64url")}`;
@@ -89,6 +100,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
   private readonly webauthn: WebAuthnPolicy | undefined;
   private readonly payeeName: PayEnvelopeServiceOptions<UserId, KeyId>["payeeName"];
   private readonly bin6: string;
+  private readonly testBin6: string;
   private readonly defaultTtlSeconds: number;
   private readonly now: () => Date;
   private readonly onEventError: (err: unknown) => void;
@@ -105,6 +117,8 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
     this.payeeName = opts.payeeName;
     this.bin6 = opts.bin6 ?? DEFAULT_BIN;
     if (!/^\d{6}$/.test(this.bin6)) throw new Error("bin6 must be 6 digits");
+    this.testBin6 = opts.testBin6 ?? DEFAULT_TEST_BIN;
+    if (!/^\d{6}$/.test(this.testBin6) || this.testBin6 === this.bin6) throw new Error("testBin6 must be 6 digits, different from bin6");
     this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TTL_SECONDS;
     this.now = opts.now ?? (() => new Date());
     this.onEventError =
@@ -144,7 +158,8 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
           existing.amount === input.amount &&
           existing.currency === input.currency &&
           existing.channel === (input.channel ?? null) &&
-          existing.amountTolerancePpm === tolerancePpm;
+          existing.amountTolerancePpm === tolerancePpm &&
+          (existing.environment ?? null) === (owner.environment ?? null);
         if (!same) throw new PayEnvelopeIdempotencyConflictError();
         return await this.toCreateOutput(existing);
       }
@@ -182,6 +197,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
         currency: input.currency,
         amount: input.amount,
         channel: input.channel ?? null,
+        environment: owner.environment ?? null,
       });
       panDigest = await this.panDigest(pan);
       if (!(await this.store.findByPanDigest(panDigest))) break;
@@ -218,6 +234,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
       idempotencyKey: input.idempotencyKey ?? null,
       receiptJws,
       metadata: input.metadata ?? null,
+      environment: owner.environment ?? null,
     });
 
     this.emit(envelopeId, owner, "created", {
@@ -242,7 +259,7 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
    */
   async resolve(
     input: ResolvePayEnvelopeInput,
-    opts: { callerMerchantId?: string } = {},
+    opts: { callerMerchantId?: string; callerEnvironment?: PayEnvelopeEnvironment } = {},
   ): Promise<ResolvePayEnvelopeOutput> {
     const auditRef = newAuditRef();
     const now = this.now();
@@ -254,6 +271,12 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
 
     const envelope = await this.store.findByPanDigest(await this.panDigest(pan));
     if (!envelope) return { decision: "DECLINE", reasonCode: "UNKNOWN_PRESENTATION", auditRef };
+    // A test key never authorizes a live card number, nor a live key a test
+    // one (made without a customer approval): to the other environment it
+    // doesn't exist.
+    if (opts.callerEnvironment && envelope.environment && envelope.environment !== opts.callerEnvironment) {
+      return { decision: "DECLINE", reasonCode: "UNKNOWN_PRESENTATION", auditRef };
+    }
 
     const plan = planResolution(envelope, txnContext, now);
     if (plan.action === "decline") {
@@ -378,12 +401,12 @@ export class PayEnvelopeService<UserId = string, KeyId = string> {
    * Deterministic, so it is recomputed when needed instead of stored.
    */
   private async derivePan(
-    e: Pick<PayEnvelopeRecord<unknown, unknown>, "id" | "createdAt" | "merchantId" | "currency" | "amount" | "channel">,
+    e: Pick<PayEnvelopeRecord<unknown, unknown>, "id" | "createdAt" | "merchantId" | "currency" | "amount" | "channel" | "environment">,
   ): Promise<string> {
     const message = [e.id, e.createdAt.getTime(), e.merchantId, e.currency, e.amount, e.channel ?? ""].join("|");
     const digest = Buffer.from(await this.keyring.mac("pan-derive", Buffer.from(message, "utf8"))).toString("hex");
     const body9 = digest.replace(/[a-f]/g, (c) => String(parseInt(c, 16) % 10)).slice(0, 9);
-    const pan = projectPan(this.bin6, body9);
+    const pan = projectPan(e.environment === "test" ? this.testBin6 : this.bin6, body9);
     if (!isValidLuhn(pan)) throw new Error("PAN projection failed Luhn validation");
     return pan;
   }

@@ -214,3 +214,29 @@ test("audit events are recorded and event failures never break a request", async
   await new Promise((r) => setImmediate(r));
   assert.equal(errors.length, 2);
 });
+
+test("test and live never cross: each authorizes only its own environment's card numbers, and test numbers can't be routed", async () => {
+  const { service, store } = setup();
+  const live = await service.create({ ...ctx }, { ...ownerA, environment: "live" });
+  const test_ = await service.create({ ...ctx }, { ...ownerA, environment: "test" });
+  assert.ok(test_.presentation.pan.startsWith("999999"), "test numbers use the non-routable prefix");
+  assert.ok(!live.presentation.pan.startsWith("999999"));
+  assert.equal(store.envelopes.get(test_.envelopeId)!.environment, "test");
+
+  // Across environments the number doesn't exist, and nothing is written.
+  const testOnLive = await service.resolve({ presentation: live.presentation, txnContext: ctx }, { callerEnvironment: "test" });
+  assert.equal(testOnLive.reasonCode, "UNKNOWN_PRESENTATION");
+  const liveOnTest = await service.resolve({ presentation: test_.presentation, txnContext: ctx }, { callerEnvironment: "live" });
+  assert.equal(liveOnTest.reasonCode, "UNKNOWN_PRESENTATION");
+  assert.equal(store.envelopes.get(live.envelopeId)!.decision, null);
+
+  // Each still works in its own environment, once.
+  assert.equal((await service.resolve({ presentation: live.presentation, txnContext: ctx }, { callerEnvironment: "live" })).decision, "APPROVE");
+  assert.equal((await service.resolve({ presentation: test_.presentation, txnContext: ctx }, { callerEnvironment: "test" })).decision, "APPROVE");
+
+  // Retrying with the same idempotency key from the other environment is a conflict, and recomputes the right number.
+  const a = await service.create({ ...ctx, idempotencyKey: "o-1" }, { ...ownerA, environment: "test" });
+  const again = await service.create({ ...ctx, idempotencyKey: "o-1" }, { ...ownerA, environment: "test" });
+  assert.equal(again.presentation.pan, a.presentation.pan);
+  await assert.rejects(service.create({ ...ctx, idempotencyKey: "o-1" }, { ...ownerA, environment: "live" }));
+});

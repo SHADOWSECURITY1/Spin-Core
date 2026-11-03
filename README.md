@@ -48,6 +48,13 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
   `burned: false` and `wrongMerchant`), but doesn't burn it: the number only
   ever pays its own merchant, and burning let anyone with leaked numbers and
   a merchant account destroy customers' payments.
+- **Test and live never cross** (0.11). Pass the creating key's
+  `environment` in the owner and the caller's as `resolve(..., {
+  callerEnvironment })`: a test key never authorizes a live card number, nor
+  a live key a test one (created without a customer approval). To the other
+  environment the number doesn't exist (`UNKNOWN_PRESENTATION`, nothing
+  written). Test card numbers start with `999999` (`testBin6`), a prefix no
+  card network routes.
 - **No card numbers at rest** (0.5). The store keeps a keyed fingerprint
   (`presentationPanDigest`), never the number. The number is recomputed from
   the envelope's details and the HMAC secret when needed.
