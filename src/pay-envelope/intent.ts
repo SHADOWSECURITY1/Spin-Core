@@ -1,6 +1,10 @@
 import { createHash, createPublicKey, verify as nodeVerify } from "node:crypto";
 import { p256 } from "@noble/curves/nist.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
+import { CHALLENGE_PREFIX, MIN_NONCE_LENGTH, canonicalIntent, isWellFormedIntent, toMinorUnits, type CustomerIntent } from "./intent-format.js";
+
+export { canonicalIntent, isWellFormedIntent, minorUnitDigits, toMinorUnits, fromMinorUnits } from "./intent-format.js";
+export type { CustomerIntent } from "./intent-format.js";
 
 /**
  * Customer-signed intent (docs/design/customer-signed-intent.md).
@@ -22,23 +26,6 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
  *                             raw P-256 public key (65 bytes, base64url), the
  *                             challenge in clientDataJSON, user verification required
  */
-
-export interface CustomerIntent {
-  v: 1;
-  /** The customer (payer), as registered by the integrator. */
-  payerId: string;
-  /** Payee merchant. */
-  merchantId: string;
-  /** Minor units (cents). Exact: no tolerance with a signed intent. */
-  amount: number;
-  currency: string;
-  /** "CNP" | "CP", or null for either. */
-  channel: string | null;
-  /** ISO 8601. The credential can't outlive the approval. */
-  expiresAt: string;
-  /** Single use. 16+ random characters chosen by the device. */
-  nonce: string;
-}
 
 export type IntentScheme = "ed25519" | "hybrid-ed25519-mldsa65" | "webauthn-es256";
 
@@ -100,33 +87,9 @@ export class PayEnvelopeIntentError extends Error {
   }
 }
 
-const CHALLENGE_PREFIX = "spin/customer-intent/v1\n";
-const MIN_NONCE_LENGTH = 16;
-
-/** Fixed key order, so device and server hash identical bytes. */
-export function canonicalIntent(i: CustomerIntent): string {
-  return JSON.stringify([i.v, i.payerId, i.merchantId, i.amount, i.currency, i.channel, i.expiresAt, i.nonce]);
-}
-
 /** What the device signs (or passes as the WebAuthn challenge). */
 export function intentChallenge(i: CustomerIntent): Uint8Array {
   return new Uint8Array(createHash("sha256").update(CHALLENGE_PREFIX + canonicalIntent(i), "utf8").digest());
-}
-
-/** Structural checks on attacker-controlled input. */
-export function isWellFormedIntent(i: unknown): i is CustomerIntent {
-  if (!i || typeof i !== "object") return false;
-  const x = i as Record<string, unknown>;
-  return (
-    x.v === 1 &&
-    typeof x.payerId === "string" && x.payerId.length > 0 &&
-    typeof x.merchantId === "string" && x.merchantId.length > 0 &&
-    Number.isInteger(x.amount) && (x.amount as number) > 0 &&
-    typeof x.currency === "string" && /^[A-Z]{3}$/.test(x.currency) &&
-    (x.channel === null || x.channel === "CNP" || x.channel === "CP") &&
-    typeof x.expiresAt === "string" && !Number.isNaN(Date.parse(x.expiresAt)) &&
-    typeof x.nonce === "string" && x.nonce.length >= MIN_NONCE_LENGTH && x.nonce.length <= 128
-  );
 }
 
 const b64u = (s: string) => new Uint8Array(Buffer.from(s, "base64url"));
@@ -137,14 +100,15 @@ function verifyEd25519(spkiB64u: string, msg: Uint8Array, sigB64u: string): bool
   return nodeVerify(null, msg, key, Buffer.from(sigB64u, "base64url"));
 }
 
-/** Minor units per currency for comparing SPC's decimal totals. */
-const ZERO_DECIMAL = new Set(["JPY", "KRW", "VND", "CLP", "ISK", "UGX", "XAF", "XOF", "PYG", "RWF"]);
-function toMinorUnits(value: string, currency: string): number | null {
-  if (!/^\d+(\.\d+)?$/.test(value)) return null;
-  const digits = ZERO_DECIMAL.has(currency) ? 0 : 2;
-  const [whole, frac = ""] = value.split(".");
-  if (frac.length > digits) return null;
-  return Number(whole) * 10 ** digits + Number(frac.padEnd(digits, "0") || "0");
+/**
+ * What a Secure Payment Confirmation prompt must have shown: the browser draws
+ * the total and payee itself, so a compromised page can't misrepresent them.
+ */
+export interface SpcExpectation {
+  amount: number;
+  currency: string;
+  /** The merchant's verified name. When set, the prompt must have shown exactly this. */
+  payeeName?: string;
 }
 
 /** A signature over a challenge, as a device produces it. */
@@ -162,7 +126,7 @@ function verifyWebAuthn(
   key: PayerKey,
   challenge: Uint8Array,
   policy: WebAuthnPolicy | undefined,
-  spcTotal: { amount: number; currency: string } | undefined,
+  spc: SpcExpectation | undefined,
 ): boolean {
   if (!policy || !proof.authenticatorData || !proof.clientDataJSON) return false;
   const clientDataBytes = b64u(proof.clientDataJSON);
@@ -174,11 +138,13 @@ function verifyWebAuthn(
 
   // Secure Payment Confirmation: the browser itself showed the total, so it must be the approved one.
   if (clientData.type === "payment.get") {
-    if (!spcTotal) return false;
-    const payment = clientData.payment as { total?: { currency?: string; value?: string } } | undefined;
+    if (!spc) return false;
+    const payment = clientData.payment as { total?: { currency?: string; value?: string }; payeeName?: string } | undefined;
     const total = payment?.total;
-    if (!total || total.currency !== spcTotal.currency) return false;
-    if (toMinorUnits(String(total.value), spcTotal.currency) !== spcTotal.amount) return false;
+    if (!total || total.currency !== spc.currency) return false;
+    if (toMinorUnits(String(total.value), spc.currency) !== spc.amount) return false;
+    // ...and the payee the browser showed must be the merchant SPIN knows.
+    if (spc.payeeName !== undefined && payment?.payeeName !== spc.payeeName) return false;
   }
 
   const authData = b64u(proof.authenticatorData);
@@ -200,7 +166,7 @@ function verifyWebAuthn(
 
 /**
  * True iff `proof` is `key`'s signature over the 32-byte `challenge`, under
- * the key's scheme. Never throws. `spcTotal` is the amount a Secure Payment
+ * the key's scheme. Never throws. `spc` is what a Secure Payment
  * Confirmation prompt must have shown (omit it to refuse SPC assertions).
  */
 export function verifyKeySignature(
@@ -208,7 +174,7 @@ export function verifyKeySignature(
   challenge: Uint8Array,
   proof: KeyProof,
   webauthn?: WebAuthnPolicy,
-  spcTotal?: { amount: number; currency: string },
+  spc?: SpcExpectation,
 ): boolean {
   try {
     if (typeof proof?.signature !== "string") return false;
@@ -224,7 +190,7 @@ export function verifyKeySignature(
         return ml_dsa65.verify(b64u(pqSig), challenge, b64u(pqPub));
       }
       case "webauthn-es256":
-        return verifyWebAuthn(proof, key, challenge, webauthn, spcTotal);
+        return verifyWebAuthn(proof, key, challenge, webauthn, spc);
       default:
         return false;
     }
@@ -239,12 +205,18 @@ export function verifyKeySignature(
  * Does not check revocation, nonces or that the intent matches a request;
  * PayEnvelopeService.create does all of that.
  */
-export function verifySignedIntent(si: SignedIntent, key: PayerKey, webauthn?: WebAuthnPolicy): boolean {
+export function verifySignedIntent(
+  si: SignedIntent,
+  key: PayerKey,
+  webauthn?: WebAuthnPolicy,
+  opts: { payeeName?: string } = {},
+): boolean {
   try {
     if (!isWellFormedIntent(si.intent) || si.intent.payerId !== key.payerId) return false;
     return verifyKeySignature(key, intentChallenge(si.intent), si, webauthn, {
       amount: si.intent.amount,
       currency: si.intent.currency,
+      payeeName: opts.payeeName,
     });
   } catch {
     return false;

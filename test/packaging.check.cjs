@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const req = (sub) => require(`@spin/core${sub}`);
 
 (async () => {
-  for (const [sub, fn] of [['', 'PayEnvelopeService'], ['/vault', 'encryptMessage'], ['/testing', 'payEnvelopeStoreConformance']]) {
+  for (const [sub, fn] of [['', 'PayEnvelopeService'], ['/vault', 'encryptMessage'], ['/testing', 'payEnvelopeStoreConformance'], ['/approval', 'approveIntent']]) {
     assert.equal(typeof req(sub)[fn], 'function', `require('@spin/core${sub}')`);
     assert.equal(typeof (await import(`@spin/core${sub}`))[fn], 'function', `import('@spin/core${sub}')`);
   }

@@ -90,6 +90,22 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
 | Amount tolerance: SPIN-Envelope stored ‰, SPIN-Vault ppm, floating-point compare | ppm everywhere, exact integer compare |
 | A new PAN could collide with an existing one | Regenerated until unused |
 
+## Approval kit (`@spin/core/approval`)
+
+The customer's side of an approval, for browsers and React Native (no Node
+APIs). The screen text and the signature come from the same intent, so what
+the customer sees is what their device signs:
+
+- `approveWithSecurePaymentConfirmation()`: the browser draws the payee and
+  total itself; the server checks both (`PayEnvelopeService`'s `payeeName`
+  option supplies the merchant's verified name). Chrome and Edge today.
+- `approveIntent({ intent, payee, keyId, confirm, sign })`: everywhere else.
+  `confirm` gets only `describeIntent()`'s text (amount, payee, verified,
+  first-time warnings); `sign` gets only that intent's challenge.
+- `newIntent()`, `intentChallenge()`, `formatAmount()`, `signWithPasskey()`.
+
+Limits: see `docs/design/approval-screen.md`.
+
 ## Vault crypto (`@spin/core/vault`)
 
 Zero-knowledge storage and messaging for SPIN Vault. No Node imports, so it

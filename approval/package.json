@@ -1,0 +1,6 @@
+{
+  "//": "Fallback for bundlers without package.json \"exports\" support (React Native Metro < 0.82 by default): lets `@spin/core/approval` resolve.",
+  "main": "../dist/approval/index.js",
+  "types": "../dist/approval/index.d.ts",
+  "sideEffects": false
+}

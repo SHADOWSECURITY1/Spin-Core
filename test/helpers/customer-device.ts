@@ -58,7 +58,7 @@ export function passkeyDevice(
   payerId: string,
   keyId = "passkey-1",
 ): Device & {
-  signWith(intent: CustomerIntent, o: { type?: string; origin?: string; rpId?: string; flags?: number; total?: { currency: string; value: string } }): SignedIntent;
+  signWith(intent: CustomerIntent, o: { type?: string; origin?: string; rpId?: string; flags?: number; total?: { currency: string; value: string }; payeeName?: string }): SignedIntent;
 } {
   const priv = p256.utils.randomSecretKey();
   const pub = p256.getPublicKey(priv, false); // 65-byte uncompressed point
@@ -68,7 +68,7 @@ export function passkeyDevice(
       challenge: b64u(intentChallenge(intent)),
       origin: o.origin ?? RP.origins[0],
     };
-    if (o.total) clientData.payment = { rpId: RP.rpId, total: o.total };
+    if (o.total) clientData.payment = { rpId: RP.rpId, total: o.total, ...(o.payeeName ? { payeeName: o.payeeName } : {}) };
     const clientDataJSON = Buffer.from(JSON.stringify(clientData), "utf8");
     const authData = Buffer.concat([
       createHash("sha256").update(o.rpId ?? RP.rpId).digest(),
