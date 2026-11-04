@@ -243,6 +243,51 @@ export class SpinAgent {
     return { ok: false, code: json?.error?.code ?? `http_${status}`, message: json?.error?.message ?? `SPIN returned ${status}` };
   }
 
+  /**
+   * Step-up: ask the person to approve one purchase that's outside their
+   * rules. The agent signs the request with its key; the person approves or
+   * declines on their own device, through the platform's app. Then poll
+   * checkApproval(). `note` is shown to the person as the agent's words.
+   */
+  async requestApproval(p: Purchase & { note?: string }): Promise<{ ok: true; requestId: string; expiresAt: string } | { ok: false; code: string; message: string }> {
+    const currency = p.currency.toUpperCase();
+    const channel = p.channel ?? null;
+    if (!Number.isSafeInteger(p.amount) || p.amount <= 0) {
+      return { ok: false, code: "invalid_amount", message: "The amount must be a positive whole number of minor units." };
+    }
+    const intent = newIntent({ payerId: this.opts.payerId, merchantId: p.merchantId, amount: p.amount, currency, channel, ttlSeconds: 600, now: this.now() });
+    const signature = toBase64Url(await this.opts.signer.sign(intentChallenge(intent)));
+    const { status, json } = await this.call("POST", `/payers/${encodeURIComponent(this.opts.payerId)}/approval-requests`, {
+      signedIntent: { intent, keyId: this.opts.signer.keyId, signature },
+      ...(p.note ? { note: p.note.slice(0, 140) } : {}),
+    });
+    if (status === 201 && typeof json?.requestId === "string") return { ok: true, requestId: json.requestId, expiresAt: json.expiresAt };
+    return { ok: false, code: json?.error?.code ?? `http_${status}`, message: json?.error?.message ?? `SPIN returned ${status}` };
+  }
+
+  /**
+   * Where a step-up request stands. Once the person approves, this collects
+   * the single-use card number (once: a second call reports "collected").
+   */
+  async checkApproval(requestId: string): Promise<
+    | { status: "pending"; expiresAt: string }
+    | { status: "declined" | "expired" | "collected" }
+    | ({ status: "approved" } & Extract<BuyResult, { ok: true }>)
+    | { status: "error"; code: string; message: string }
+  > {
+    const id = encodeURIComponent(requestId);
+    const got = await this.call("GET", `/approval-requests/${id}`);
+    if (got.status !== 200) return { status: "error", code: got.json?.error?.code ?? `http_${got.status}`, message: got.json?.error?.message ?? `SPIN returned ${got.status}` };
+    const st = got.json.status as string;
+    if (st === "pending") return { status: "pending", expiresAt: got.json.expiresAt };
+    if (st !== "approved") return { status: st as "declined" | "expired" | "collected" };
+    const { status, json } = await this.call("POST", `/approval-requests/${id}/collect`, {});
+    if (status === 201 && typeof json?.presentation?.pan === "string") {
+      return { status: "approved", ok: true, envelopeId: json.envelopeId, pan: json.presentation.pan, expiresAt: json.expiresAt, mandateId: "", receiptJws: json.receiptJws };
+    }
+    return { status: "error", code: json?.error?.code ?? `http_${status}`, message: json?.error?.message ?? `SPIN returned ${status}` };
+  }
+
   /** Whether a purchase's card number was charged, declined, or expired. */
   async status(envelopeId: string): Promise<{ ok: true; status: Record<string, unknown> } | { ok: false; code: string; message: string }> {
     const { status, json } = await this.call("GET", `/envelopes/${encodeURIComponent(envelopeId)}/status`);

@@ -11,7 +11,7 @@ import { fromMinorUnits, toMinorUnits } from "../pay-envelope/intent-format.js";
 import type { SpinAgent } from "./index.js";
 
 export const MCP_SERVER_NAME = "spin";
-export const MCP_SERVER_VERSION = "0.13.1";
+export const MCP_SERVER_VERSION = "0.14.0";
 const PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 interface JsonRpcRequest {
@@ -51,6 +51,38 @@ const TOOLS = [
       additionalProperties: false,
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  {
+    name: "spin_request_approval",
+    title: "Ask the person to approve one purchase",
+    description:
+      "Only for a purchase the person clearly wants that spin_buy refused as outside their rules (another merchant, or over a limit). Sends the person a request to approve this ONE purchase on their phone. Ask once; if they decline, accept it and don't ask again. Then call spin_check_approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        merchantId: { type: "string", description: "The merchant's SPIN id." },
+        amount: { type: "string", pattern: "^\\d+(\\.\\d+)?$", description: 'The exact total, as a decimal string, e.g. "35.00".' },
+        currency: { type: "string", pattern: "^[A-Za-z]{3}$", description: 'ISO 4217 code, e.g. "USD".' },
+        channel: { type: "string", enum: ["CNP", "CP"], description: "CNP for online, CP for in person. Omit if unsure." },
+        note: { type: "string", maxLength: 140, description: "One short, factual sentence the person will see, e.g. why this costs more than usual." },
+      },
+      required: ["merchantId", "amount", "currency"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  {
+    name: "spin_check_approval",
+    title: "Check an approval request",
+    description:
+      "Whether the person approved a request from spin_request_approval. If approved, returns a card number that works once, at that merchant, for that exact amount. If still pending, check again later; don't ask the person again.",
+    inputSchema: {
+      type: "object",
+      properties: { requestId: { type: "string", description: "The requestId spin_request_approval returned." } },
+      required: ["requestId"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, openWorldHint: true },
   },
   {
     name: "spin_purchase_status",
@@ -106,6 +138,45 @@ export function createSpinMcpHandler(agent: SpinAgent) {
             `Purchase id: ${r.envelopeId}.`,
           { ok: true, envelopeId: r.envelopeId, pan: r.pan, expiresAt: r.expiresAt, merchantId, amount: fromMinorUnits(amount, currency), currency },
         );
+      }
+      case "spin_request_approval": {
+        const merchantId = str(args.merchantId);
+        const currency = str(args.currency)?.toUpperCase();
+        const amountText = str(args.amount);
+        const channel = args.channel === "CNP" || args.channel === "CP" ? args.channel : undefined;
+        if (!merchantId || !currency || !/^[A-Z]{3}$/.test(currency) || !amountText) {
+          return text("merchantId, amount (a decimal string) and currency are required.", undefined, true);
+        }
+        const amount = toMinorUnits(amountText, currency);
+        if (amount === null || amount <= 0) return text(`"${amountText}" isn't a valid ${currency} amount.`, undefined, true);
+        const r = await agent.requestApproval({ merchantId, amount, currency, channel, note: str(args.note) });
+        if (!r.ok) return text(`SPIN refused the request (${r.code}): ${r.message}`, { ok: false, code: r.code }, true);
+        return text(
+          `Asked the person to approve ${fromMinorUnits(amount, currency)} ${currency} at ${merchantId}. Request id: ${r.requestId}. ` +
+            `It expires at ${r.expiresAt}. Check with spin_check_approval; don't ask again.`,
+          { ok: true, requestId: r.requestId, expiresAt: r.expiresAt },
+        );
+      }
+      case "spin_check_approval": {
+        const id = str(args.requestId);
+        if (!id) return text("requestId is required.", undefined, true);
+        const r = await agent.checkApproval(id);
+        switch (r.status) {
+          case "pending":
+            return text(`Still waiting for the person (until ${r.expiresAt}).`, r);
+          case "approved":
+            return text(`Approved. Card number ${r.pan}. It works once, for exactly the approved merchant and amount, until ${r.expiresAt}. Purchase id: ${r.envelopeId}.`, {
+              status: "approved", envelopeId: r.envelopeId, pan: r.pan, expiresAt: r.expiresAt,
+            });
+          case "declined":
+            return text("The person declined. Don't buy it, and don't ask again.", r);
+          case "expired":
+            return text("The request expired without an answer. Don't buy it.", r);
+          case "collected":
+            return text("This approval's card number was already handed out. Each approval gives one card number.", r);
+          default:
+            return text(`SPIN refused (${r.code}): ${r.message}`, { status: "error", code: r.code }, true);
+        }
       }
       case "spin_purchase_status": {
         const id = str(args.envelopeId);

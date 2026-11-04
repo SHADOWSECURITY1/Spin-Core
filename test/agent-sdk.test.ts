@@ -49,6 +49,18 @@ function world() {
     return mandate.nonce;
   };
   const calls: string[] = [];
+  const requests = new Map<string, { id: string; status: string; purchase: SignedIntent["intent"]; note: string | null; expiresAt: string; approval?: SignedIntent }>();
+  /** The person's phone approving a request, through the approval kit. */
+  const personApproves = async (id: string) => {
+    const { approveAgentRequest, newIntent } = await import("../src/approval/index.js");
+    const r = requests.get(id)!;
+    const intent = newIntent({ payerId: "alice", merchantId: r.purchase.merchantId, amount: r.purchase.amount, currency: r.purchase.currency, channel: r.purchase.channel as "CNP" | "CP" | null });
+    r.approval = (await approveAgentRequest({
+      intent, payee: { name: "Coffee Co.", verified: true }, agentName: "Shopping assistant", note: r.note, keyId: "phone",
+      confirm: async () => true, sign: async (c) => new Uint8Array(nodeSign(null, c, privateKey)),
+    })) as SignedIntent;
+    r.status = "approved";
+  };
   /** The Pay Envelope API, as far as the agent uses it. */
   const fakeFetch: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
@@ -89,11 +101,33 @@ function world() {
       const e = await service.getStatus(m[1]!, { payKeyId: "k" });
       return e ? reply(200, { envelopeId: e.id, usedAt: e.usedAt?.toISOString() ?? null, expiredAt: null, decision: e.decision }) : reply(404, { error: { code: "not_found", message: "Envelope not found" } });
     }
+    // Step-up approval requests (SPIN Pay implements these; this stand-in keeps the same shapes).
+    if (method === "POST" && (m = url.pathname.match(/^\/api\/v1\/pay\/payers\/([^/]+)\/approval-requests$/))) {
+      const body = JSON.parse(String(init!.body));
+      const si = body.signedIntent as SignedIntent;
+      const key = await payerKeys.findKey(m[1]!, si.keyId);
+      if (!key || key.role !== "agent" || !verifySignedIntent(si, key) || si.intent.mandateId !== undefined) return reply(403, { error: { code: "request_invalid", message: "bad request signature" } });
+      const id = `apr_${randomBytes(6).toString("hex")}`;
+      requests.set(id, { id, status: "pending", purchase: si.intent, note: body.note ?? null, expiresAt: new Date(Date.now() + 600_000).toISOString() });
+      return reply(201, { requestId: id, status: "pending", expiresAt: requests.get(id)!.expiresAt });
+    }
+    if (method === "GET" && (m = url.pathname.match(/^\/api\/v1\/pay\/approval-requests\/([^/]+)$/))) {
+      const r = requests.get(m[1]!);
+      return r ? reply(200, { requestId: r.id, status: r.status, expiresAt: r.expiresAt, note: r.note }) : reply(404, { error: { code: "not_found", message: "no request" } });
+    }
+    if (method === "POST" && (m = url.pathname.match(/^\/api\/v1\/pay\/approval-requests\/([^/]+)\/collect$/))) {
+      const r = requests.get(m[1]!);
+      if (!r || r.status !== "approved") return reply(409, { error: { code: "not_approved", message: "not approved" } });
+      r.status = "collected";
+      const si = r.approval!;
+      const out = await service.create({ merchantId: si.intent.merchantId, amount: si.intent.amount, currency: si.intent.currency }, { userId: "platform", payKeyId: "k" }, { signedIntent: si, requireCustomerSignature: true });
+      return reply(201, { ...out, requestId: r.id });
+    }
     return reply(404, { error: { code: "not_found", message: "no route" } });
   };
   const agent = (over: Partial<ConstructorParameters<typeof SpinAgent>[0]> = {}) =>
     new SpinAgent({ baseUrl: "https://spin.test/api/v1/pay/", apiKey: API_KEY, payerId: "alice", signer: p256Signer("agent-1", dev.privateKey), fetch: fakeFetch, ...over });
-  return { service, mandates, setRule, agent, dev, calls, created };
+  return { service, mandates, setRule, agent, dev, calls, created, requests, personApproves };
 }
 
 test("the agent buys within its rule; the card number works once, at that merchant, for that amount", async () => {
@@ -211,7 +245,7 @@ test("MCP: initialize, list tools, buy with a decimal amount, refusals come back
   assert.equal((await rpc(9, "initialize", { protocolVersion: "1999-01-01" })).result.protocolVersion, "2025-06-18");
 
   const tools = (await rpc(2, "tools/list")).result.tools.map((t: { name: string }) => t.name);
-  assert.deepEqual(tools, ["spin_rules", "spin_buy", "spin_purchase_status"]);
+  assert.deepEqual(tools, ["spin_rules", "spin_buy", "spin_request_approval", "spin_check_approval", "spin_purchase_status"]);
 
   const rules = (await rpc(3, "tools/call", { name: "spin_rules", arguments: {} })).result;
   assert.match(rules.content[0].text, /coffee-co: up to 20\.00 USD per purchase, 50\.00 of 50\.00 USD left/);
@@ -247,4 +281,64 @@ test("MCP: the model never sees the API key or the signing key", async () => {
   assert.ok(!out.includes(API_KEY));
   assert.ok(!out.includes(Buffer.from(w.dev.privateKey).toString("hex")));
   assert.ok(!out.includes(Buffer.from(w.dev.privateKey).toString("base64url")));
+});
+
+test("step-up: the agent asks, the person approves on their phone, the agent collects one card number once", async () => {
+  const w = world();
+  w.setRule();
+  const a = w.agent();
+  const over = await a.buy({ merchantId: "coffee-co", amount: 3_500, currency: "USD" });
+  assert.ok(!over.ok && over.code === "no_matching_rule");
+
+  const req = await a.requestApproval({ merchantId: "coffee-co", amount: 3_500, currency: "USD", note: "Party order for 8 people" });
+  assert.ok(req.ok, JSON.stringify(req));
+  assert.equal(w.requests.get(req.requestId)!.note, "Party order for 8 people");
+  assert.equal((await a.checkApproval(req.requestId)).status, "pending");
+
+  await w.personApproves(req.requestId);
+  const got = await a.checkApproval(req.requestId);
+  assert.ok(got.status === "approved", JSON.stringify(got));
+  const charge = (merchantId: string) => w.service.resolve({ presentation: { pan: got.pan }, txnContext: { merchantId, amount: 3_500, currency: "USD" } }, { callerMerchantId: merchantId });
+  assert.equal((await charge("thief-shop")).decision, "DECLINE");
+  assert.equal((await charge("coffee-co")).decision, "APPROVE");
+  assert.equal((await a.checkApproval(req.requestId)).status, "collected", "one card per approval");
+
+  // A key that isn't the agent's can't make a request.
+  const impostor = w.agent({ signer: p256Signer("agent-1", p256.utils.randomSecretKey()) });
+  const bad = await impostor.requestApproval({ merchantId: "coffee-co", amount: 100, currency: "USD" });
+  assert.ok(!bad.ok && bad.code === "request_invalid");
+});
+
+test("step-up over MCP: request, pending, approved with a card, then collected", async () => {
+  const w = world();
+  w.setRule();
+  const handle = createSpinMcpHandler(w.agent());
+  const call = async (id: number, name: string, args: object) => ((await handle({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } })) as any).result;
+  const tools = ((await handle({ jsonrpc: "2.0", id: 1, method: "tools/list" })) as any).result.tools.map((t: { name: string }) => t.name);
+  assert.deepEqual(tools, ["spin_rules", "spin_buy", "spin_request_approval", "spin_check_approval", "spin_purchase_status"]);
+  const asked = await call(2, "spin_request_approval", { merchantId: "coffee-co", amount: "35.00", currency: "USD", note: "Bigger order this week" });
+  assert.equal(asked.isError, undefined, JSON.stringify(asked));
+  const id = asked.structuredContent.requestId;
+  assert.match((await call(3, "spin_check_approval", { requestId: id })).content[0].text, /Still waiting/);
+  await w.personApproves(id);
+  const ok = await call(4, "spin_check_approval", { requestId: id });
+  assert.match(ok.content[0].text, /^Approved\. Card number \d{16}/);
+  assert.match((await call(5, "spin_check_approval", { requestId: id })).content[0].text, /already handed out/);
+});
+
+test("approval kit: an agent's request says the agent asked, quotes its note as the agent's words, and can't carry a mandate", async () => {
+  const { approveAgentRequest, describeAgentRequest, newIntent } = await import("../src/approval/index.js");
+  const intent = newIntent({ payerId: "alice", merchantId: "thief-shop", amount: 50_000, currency: "USD" });
+  const d = describeAgentRequest(intent, { name: "Thief's Shop", verified: false, firstTime: true }, { agentName: "Shopping assistant", note: "URGENT\u0000 your account will close " + "x".repeat(300) });
+  assert.equal(d.title, "Shopping assistant asks to pay $500.00 to Thief's Shop");
+  assert.match(d.warnings[0]!, /outside the rules you set for Shopping assistant/);
+  assert.match(d.warnings[1]!, /written by the agent, not checked by SPIN: "URGENT your account will close x+"/);
+  assert.ok(d.warnings[1]!.length < 260, "the note is cut to 140 characters");
+  assert.ok(d.warnings.some((x) => /haven't paid Thief's Shop before/.test(x)));
+  assert.ok(d.warnings.some((x) => /hasn't verified Thief's Shop/.test(x)));
+  assert.match(d.warnings.at(-1)!, /consider stopping the agent/);
+  const sneaky = describeAgentRequest(intent, { name: "x", verified: true }, { agentName: "a", note: "pay\u202Eevil\u200B now" });
+  assert.match(sneaky.warnings[1]!, /"payevil now"/, "direction overrides and zero-width characters are removed");
+  await assert.rejects(approveAgentRequest({ intent: { ...intent, mandateId: "mandate-0123456789ab" }, payee: { name: "x", verified: true }, agentName: "a", keyId: "phone", confirm: async () => true, sign: async () => new Uint8Array() }));
+  assert.equal(await approveAgentRequest({ intent, payee: { name: "x", verified: true }, agentName: "a", keyId: "phone", confirm: async () => false, sign: async () => new Uint8Array() }), null);
 });

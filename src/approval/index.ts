@@ -353,6 +353,65 @@ export async function approveIntent(p: {
   };
 }
 
+// ── Step-up: an agent asks the person to approve one purchase ───────────────
+
+/** Longest agent note SPIN accepts and the screen shows. */
+export const MAX_AGENT_NOTE = 140;
+
+/**
+ * The approval screen for a purchase an AI agent asked for because it's
+ * outside the person's rules. Says plainly that the agent asked, and shows the
+ * agent's note as the agent's words: a hijacked agent writes notes too.
+ */
+export function describeAgentRequest(
+  intent: CustomerIntent,
+  payee: PayeeProfile,
+  opts: { agentName: string; note?: string | null; locale?: string },
+): ApprovalDescription {
+  const base = describeIntent(intent, payee, opts.locale);
+  const note = (opts.note ?? "").replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, "").replace(/[\u0000-\u001f\u007f\s]+/g, " ").trim().slice(0, MAX_AGENT_NOTE);
+  return {
+    title: `${opts.agentName} asks to pay ${formatAmount(intent.amount, intent.currency, opts.locale)} to ${payee.name}`,
+    details: base.details,
+    warnings: [
+      `This is outside the rules you set for ${opts.agentName}. Approving allows this one payment only.`,
+      ...(note ? [`${opts.agentName}'s note, written by the agent, not checked by SPIN: "${note}"`] : []),
+      ...base.warnings,
+      "If you didn't expect this, decline it, and consider stopping the agent.",
+    ],
+  };
+}
+
+/**
+ * Show an agent's request and sign it, as one step, on the person's own
+ * device. The same guarantee as approveIntent: what's shown and what's signed
+ * come from one intent. Returns null if the person declines.
+ */
+export async function approveAgentRequest(p: {
+  intent: CustomerIntent;
+  payee: PayeeProfile;
+  agentName: string;
+  note?: string | null;
+  keyId: string;
+  confirm: (description: ApprovalDescription) => Promise<boolean>;
+  sign: (challenge: Uint8Array) => Promise<Uint8Array | { signature: Uint8Array; authenticatorData?: Uint8Array; clientDataJSON?: Uint8Array }>;
+  locale?: string;
+}): Promise<SignedIntentOut | null> {
+  if (!isWellFormedIntent(p.intent)) throw new Error("Malformed intent");
+  if (p.intent.mandateId !== undefined) throw new Error("A person's approval doesn't name a mandate");
+  const intent = Object.freeze({ ...p.intent });
+  if (!(await p.confirm(describeAgentRequest(intent, p.payee, { agentName: p.agentName, note: p.note, locale: p.locale })))) return null;
+  const out = await p.sign(intentChallenge(intent));
+  if (out instanceof Uint8Array) return { intent, keyId: p.keyId, signature: toBase64Url(out) };
+  return {
+    intent,
+    keyId: p.keyId,
+    signature: toBase64Url(out.signature),
+    ...(out.authenticatorData ? { authenticatorData: toBase64Url(out.authenticatorData) } : {}),
+    ...(out.clientDataJSON ? { clientDataJSON: toBase64Url(out.clientDataJSON) } : {}),
+  };
+}
+
 /** A `sign` for approveIntent using a passkey (WebAuthn) in the browser. */
 export function signWithPasskey(p: { rpId: string; credentialId: Uint8Array; timeoutMs?: number }) {
   return async (challenge: Uint8Array) => {
