@@ -11,7 +11,7 @@ import { fromMinorUnits, toMinorUnits } from "../pay-envelope/intent-format.js";
 import type { SpinAgent } from "./index.js";
 
 export const MCP_SERVER_NAME = "spin";
-export const MCP_SERVER_VERSION = "0.13.0";
+export const MCP_SERVER_VERSION = "0.13.1";
 const PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 interface JsonRpcRequest {
