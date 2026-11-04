@@ -109,6 +109,43 @@ cap is reserved atomically. A hijacked agent can't leave its mandate
 `describeMandate`, `approveMandate` and `newIntent({ mandateId })`. Design:
 `docs/design/agent-mandates.md`.
 
+## Agent SDK and MCP server (`@spin/core/agent`, 0.13)
+
+For agent platforms. `SpinAgent` buys under the person's mandate: it lists
+the rules (`rules()`), picks one that fits, signs the purchase with the
+agent's key and asks SPIN for a single-use card number (`buy()`), and checks
+whether it was charged (`status()`). The key stays in AWS KMS
+(`awsKmsSigner`; `p256Signer` for development). Refusals come back as
+`{ ok: false, code, message }` in words the agent can pass on; SPIN's server
+re-checks everything.
+
+```ts
+import { KMS } from "@aws-sdk/client-kms";
+import { SpinAgent, awsKmsSigner } from "@spin/core/agent";
+
+const agent = new SpinAgent({
+  baseUrl: "https://spin.example/api/v1/pay", apiKey: process.env.SPIN_API_KEY!, payerId,
+  signer: awsKmsSigner({ keyId: "agent-1", kmsKeyId: process.env.KMS_KEY_ARN!, kms: new KMS({}) }),
+});
+const r = await agent.buy({ merchantId: "coffee-co", amount: 1250, currency: "USD" });
+if (r.ok) checkout(r.pan); else tellThePerson(r.message);
+```
+
+**MCP:** `npx spin-mcp` serves three tools over stdio: `spin_rules`,
+`spin_buy` (amount as a decimal string) and `spin_purchase_status`. The
+model sees only card numbers that work once; the API key and signing key
+stay in the server process and KMS. Configure with `SPIN_BASE_URL`,
+`SPIN_API_KEY`, `SPIN_PAYER_ID`, `SPIN_AGENT_KEY_ID`, optional
+`SPIN_MANDATE_ID`, and `SPIN_AWS_KMS_KEY_ID` (install
+`@aws-sdk/client-kms`) or, for development, `SPIN_DEV_PRIVATE_KEY`.
+
+```json
+{ "mcpServers": { "spin": { "command": "npx", "args": ["spin-mcp"],
+  "env": { "SPIN_BASE_URL": "https://spin.example/api/v1/pay", "SPIN_API_KEY": "sp_live_...",
+           "SPIN_PAYER_ID": "payer_...", "SPIN_AGENT_KEY_ID": "agent-1",
+           "SPIN_AWS_KMS_KEY_ID": "arn:aws:kms:..." } } } }
+```
+
 ## Approval kit (`@spin/core/approval`)
 
 The customer's side of an approval, for browsers and React Native (no Node
