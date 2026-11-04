@@ -242,3 +242,30 @@ for (const c of mandateStoreConformance({
 })) {
   test(`MemoryMandateStore ${c.name}`, c.run);
 }
+
+test("approval kit: approving an agent's key produces exactly what the server checks, and can't approve itself", async () => {
+  const { enrollmentChallenge: serverChallenge, isWellFormedEnrollment, verifyKeySignature } = await import("../src/index.js");
+  const { approveAgentEnrollment, describeAgentEnrollment, enrollmentChallenge: kitChallenge, newAgentEnrollment } = await import("../src/approval/index.js");
+  const person = phone("alice");
+  const bot = agent("alice");
+  const e = newAgentEnrollment({ payerId: "alice", keyId: "agent-1", publicKey: bot.key.publicKey });
+  assert.ok(isWellFormedEnrollment(e));
+  assert.deepEqual(kitChallenge(e), serverChallenge(e));
+  const device = { v: 1 as const, payerId: "alice", newKey: { keyId: "p2", scheme: "ed25519", publicKey: "pk" }, expiresAt: e.expiresAt, nonce: e.nonce };
+  assert.deepEqual(kitChallenge(device), serverChallenge(device as never), "device enrollments too");
+  assert.ok(Date.parse(e.expiresAt) - Date.now() <= 600_000);
+
+  let shown: string | undefined;
+  const approval = await approveAgentEnrollment({
+    enrollment: e, agentName: "Shopping assistant", keyId: "phone",
+    confirm: async (d) => { shown = d.title; return true; },
+    sign: async (c) => Buffer.from(person.signBytes(c), "base64url"),
+  });
+  assert.equal(shown, "Add Shopping assistant as an AI agent");
+  assert.ok(approval && verifyKeySignature(person.key, serverChallenge(approval.enrollment), approval));
+  assert.match(describeAgentEnrollment(e, { agentName: "x" }).details[2]!, /fingerprint [0-9A-F]{2} [0-9A-F]{2} [0-9A-F]{2} [0-9A-F]{2}$/);
+
+  assert.equal(await approveAgentEnrollment({ enrollment: e, agentName: "x", keyId: "phone", confirm: async () => false, sign: async () => new Uint8Array() }), null);
+  await assert.rejects(approveAgentEnrollment({ enrollment: e, agentName: "x", keyId: "agent-1", confirm: async () => true, sign: async () => new Uint8Array() }));
+  await assert.rejects(approveAgentEnrollment({ enrollment: { ...e, newKey: { ...e.newKey, role: undefined as never } }, agentName: "x", keyId: "phone", confirm: async () => true, sign: async () => new Uint8Array() }));
+});

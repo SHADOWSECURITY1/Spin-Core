@@ -106,7 +106,9 @@ until when. Pass a `MandateStore` as `PayEnvelopeService`'s `mandates`
 option; every agent purchase is checked against the mandate and its 24-hour
 cap is reserved atomically. A hijacked agent can't leave its mandate
 (`test/agent.test.ts`). The approval kit adds `newMandate`,
-`describeMandate`, `approveMandate` and `newIntent({ mandateId })`. Design:
+`describeMandate`, `approveMandate` and `newIntent({ mandateId })`, and for
+the person's device approving an agent's key, `newAgentEnrollment`,
+`describeAgentEnrollment`, `approveAgentEnrollment` and `enrollmentChallenge`. Design:
 `docs/design/agent-mandates.md`.
 
 ## Agent SDK and MCP server (`@spin/core/agent`, 0.13)

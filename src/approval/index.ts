@@ -240,6 +240,87 @@ export async function approveMandate(p: {
   };
 }
 
+// ── Approving an AI agent's key ──────────────────────────────────────────────
+
+/** A request to add an agent's key, as the person's device approves it (the server's DeviceEnrollment with role "agent"). */
+export interface AgentEnrollment {
+  v: 1;
+  payerId: string;
+  newKey: { keyId: string; scheme: "ecdsa-p256"; publicKey: string; role: "agent" };
+  expiresAt: string;
+  nonce: string;
+}
+
+/** The 32 bytes a person's device signs to add a key (the same as the server's enrollmentChallenge). */
+export function enrollmentChallenge(e: {
+  v: 1;
+  payerId: string;
+  newKey: { keyId: string; scheme: string; publicKey: string; role?: "agent" };
+  expiresAt: string;
+  nonce: string;
+}): Uint8Array {
+  const base = [e.v, e.payerId, e.newKey.keyId, e.newKey.scheme, e.newKey.publicKey, e.expiresAt, e.nonce];
+  return sha256(utf8("spin/enroll-device/v1\n" + JSON.stringify(e.newKey.role === undefined ? base : [...base, e.newKey.role])));
+}
+
+/** A fresh request to add an agent's P-256 key (raw public key, base64url). Expires in 10 minutes by default (at most 60). */
+export function newAgentEnrollment(p: { payerId: string; keyId: string; publicKey: string; ttlSeconds?: number; now?: Date }): AgentEnrollment {
+  const nonce = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(nonce);
+  const now = p.now ?? new Date();
+  return {
+    v: 1,
+    payerId: p.payerId,
+    newKey: { keyId: p.keyId, scheme: "ecdsa-p256", publicKey: p.publicKey, role: "agent" },
+    expiresAt: new Date(now.getTime() + Math.min(p.ttlSeconds ?? 600, 3600) * 1000).toISOString(),
+    nonce: toBase64Url(nonce),
+  };
+}
+
+/** What the person's approval screen shows for adding an agent. The key's fingerprint lets them match it to what the agent's platform shows. */
+export function describeAgentEnrollment(e: AgentEnrollment, opts: { agentName: string }): ApprovalDescription {
+  const fingerprint = Array.from(sha256(utf8(e.newKey.publicKey)).slice(0, 4), (b) => b.toString(16).padStart(2, "0")).join(" ").toUpperCase();
+  return {
+    title: `Add ${opts.agentName} as an AI agent`,
+    details: [
+      "It can only buy under standing rules you set, and you can remove it any time",
+      "It can't approve devices, set its own rules, or see your card numbers",
+      `Key ${e.newKey.keyId}, fingerprint ${fingerprint}`,
+    ],
+    warnings: ["Only approve an agent you set up yourself."],
+  };
+}
+
+/**
+ * Show a request to add an agent's key and sign it, as one step (a person's
+ * own device). Returns the approval to send with the agent's enrollment, or
+ * null if the person declines.
+ */
+export async function approveAgentEnrollment(p: {
+  enrollment: AgentEnrollment;
+  agentName: string;
+  keyId: string;
+  confirm: (description: ApprovalDescription) => Promise<boolean>;
+  sign: (challenge: Uint8Array) => Promise<Uint8Array | { signature: Uint8Array; authenticatorData?: Uint8Array; clientDataJSON?: Uint8Array }>;
+}): Promise<{ enrollment: AgentEnrollment; keyId: string; signature: string; authenticatorData?: string; clientDataJSON?: string } | null> {
+  const e = p.enrollment;
+  if (e.v !== 1 || e.newKey.role !== "agent" || e.newKey.scheme !== "ecdsa-p256" || !e.payerId || !e.newKey.keyId || !e.newKey.publicKey) {
+    throw new Error("Malformed agent enrollment");
+  }
+  if (p.keyId === e.newKey.keyId) throw new Error("An agent's key is approved by a person's device, not by itself");
+  const enrollment = Object.freeze({ ...e, newKey: Object.freeze({ ...e.newKey }) }) as AgentEnrollment;
+  if (!(await p.confirm(describeAgentEnrollment(enrollment, { agentName: p.agentName })))) return null;
+  const out = await p.sign(enrollmentChallenge(enrollment));
+  if (out instanceof Uint8Array) return { enrollment, keyId: p.keyId, signature: toBase64Url(out) };
+  return {
+    enrollment,
+    keyId: p.keyId,
+    signature: toBase64Url(out.signature),
+    ...(out.authenticatorData ? { authenticatorData: toBase64Url(out.authenticatorData) } : {}),
+    ...(out.clientDataJSON ? { clientDataJSON: toBase64Url(out.clientDataJSON) } : {}),
+  };
+}
+
 /**
  * Show the approval and sign it, as one step. `confirm` receives only the
  * description derived from `intent`; `sign` receives only the challenge for
