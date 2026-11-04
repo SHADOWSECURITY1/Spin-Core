@@ -133,8 +133,15 @@ const r = await agent.buy({ merchantId: "coffee-co", amount: 1250, currency: "US
 if (r.ok) checkout(r.pan); else tellThePerson(r.message);
 ```
 
-**MCP:** `npx spin-mcp` serves three tools over stdio: `spin_rules`,
-`spin_buy` (amount as a decimal string) and `spin_purchase_status`. The
+**Step-up:** when a purchase is outside the rules, `requestApproval()` asks
+the person to approve that one purchase (signed by the agent's key, with an
+optional note); `checkApproval()` collects the single-use card once they
+approve on their own device. The approval kit's `approveAgentRequest` shows
+the request as the agent's, quotes its note as the agent's words, and signs.
+
+**MCP:** `npx spin-mcp` serves five tools over stdio: `spin_rules`,
+`spin_buy` (amount as a decimal string), `spin_request_approval`,
+`spin_check_approval` and `spin_purchase_status`. The
 model sees only card numbers that work once; the API key and signing key
 stay in the server process and KMS. Configure with `SPIN_BASE_URL`,
 `SPIN_API_KEY`, `SPIN_PAYER_ID`, `SPIN_AGENT_KEY_ID`, optional
