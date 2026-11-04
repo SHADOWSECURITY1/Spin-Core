@@ -145,6 +145,12 @@ interface MandateView {
 
 export class SpinAgent {
   private readonly base: string;
+  /**
+   * Collect secrets for this agent's own requests, by request id. They live
+   * only in this process: never in the model's context or in tool output, so
+   * an agent that learns another request's id still can't collect its card.
+   */
+  private readonly collectTokens = new Map<string, string>();
   private readonly fetch: typeof fetch;
   private readonly now: () => Date;
 
@@ -261,7 +267,10 @@ export class SpinAgent {
       signedIntent: { intent, keyId: this.opts.signer.keyId, signature },
       ...(p.note ? { note: p.note.slice(0, 140) } : {}),
     });
-    if (status === 201 && typeof json?.requestId === "string") return { ok: true, requestId: json.requestId, expiresAt: json.expiresAt };
+    if (status === 201 && typeof json?.requestId === "string") {
+      if (typeof json.collectToken === "string") this.collectTokens.set(json.requestId, json.collectToken);
+      return { ok: true, requestId: json.requestId, expiresAt: json.expiresAt };
+    }
     return { ok: false, code: json?.error?.code ?? `http_${status}`, message: json?.error?.message ?? `SPIN returned ${status}` };
   }
 
@@ -278,10 +287,19 @@ export class SpinAgent {
     const id = encodeURIComponent(requestId);
     const got = await this.call("GET", `/approval-requests/${id}`);
     if (got.status !== 200) return { status: "error", code: got.json?.error?.code ?? `http_${got.status}`, message: got.json?.error?.message ?? `SPIN returned ${got.status}` };
+    // Only this agent's own requests, for its own person.
+    if (got.json.payerId !== this.opts.payerId || got.json.agentKeyId !== this.opts.signer.keyId) {
+      return { status: "error", code: "not_this_agents_request", message: "That request was made by another agent or for another person." };
+    }
     const st = got.json.status as string;
     if (st === "pending") return { status: "pending", expiresAt: got.json.expiresAt };
     if (st !== "approved") return { status: st as "declined" | "expired" | "collected" };
-    const { status, json } = await this.call("POST", `/approval-requests/${id}/collect`, {});
+    const collectToken = this.collectTokens.get(requestId);
+    if (!collectToken) {
+      return { status: "error", code: "not_this_agents_request", message: "This agent didn't make that request (or was restarted since), so it can't collect the card. Ask again if the person still wants it." };
+    }
+    const { status, json } = await this.call("POST", `/approval-requests/${id}/collect`, { collectToken });
+    if (status === 201) this.collectTokens.delete(requestId);
     if (status === 201 && typeof json?.presentation?.pan === "string") {
       return { status: "approved", ok: true, envelopeId: json.envelopeId, pan: json.presentation.pan, expiresAt: json.expiresAt, mandateId: "", receiptJws: json.receiptJws };
     }

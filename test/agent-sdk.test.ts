@@ -49,7 +49,7 @@ function world() {
     return mandate.nonce;
   };
   const calls: string[] = [];
-  const requests = new Map<string, { id: string; status: string; purchase: SignedIntent["intent"]; note: string | null; expiresAt: string; approval?: SignedIntent }>();
+  const requests = new Map<string, { id: string; status: string; purchase: SignedIntent["intent"]; note: string | null; expiresAt: string; payerId: string; agentKeyId: string; collectToken: string; approval?: SignedIntent }>();
   /** The person's phone approving a request, through the approval kit. */
   const personApproves = async (id: string) => {
     const { approveAgentRequest, newIntent } = await import("../src/approval/index.js");
@@ -108,16 +108,18 @@ function world() {
       const key = await payerKeys.findKey(m[1]!, si.keyId);
       if (!key || key.role !== "agent" || !verifySignedIntent(si, key) || si.intent.mandateId !== undefined) return reply(403, { error: { code: "request_invalid", message: "bad request signature" } });
       const id = `apr_${randomBytes(6).toString("hex")}`;
-      requests.set(id, { id, status: "pending", purchase: si.intent, note: body.note ?? null, expiresAt: new Date(Date.now() + 600_000).toISOString() });
-      return reply(201, { requestId: id, status: "pending", expiresAt: requests.get(id)!.expiresAt });
+      const collectToken = randomBytes(16).toString("hex");
+      requests.set(id, { id, status: "pending", purchase: si.intent, note: body.note ?? null, expiresAt: new Date(Date.now() + 600_000).toISOString(), payerId: m[1]!, agentKeyId: si.keyId, collectToken });
+      return reply(201, { requestId: id, status: "pending", expiresAt: requests.get(id)!.expiresAt, collectToken });
     }
     if (method === "GET" && (m = url.pathname.match(/^\/api\/v1\/pay\/approval-requests\/([^/]+)$/))) {
       const r = requests.get(m[1]!);
-      return r ? reply(200, { requestId: r.id, status: r.status, expiresAt: r.expiresAt, note: r.note }) : reply(404, { error: { code: "not_found", message: "no request" } });
+      return r ? reply(200, { requestId: r.id, payerId: r.payerId, agentKeyId: r.agentKeyId, status: r.status, expiresAt: r.expiresAt, note: r.note }) : reply(404, { error: { code: "not_found", message: "no request" } });
     }
     if (method === "POST" && (m = url.pathname.match(/^\/api\/v1\/pay\/approval-requests\/([^/]+)\/collect$/))) {
       const r = requests.get(m[1]!);
       if (!r || r.status !== "approved") return reply(409, { error: { code: "not_approved", message: "not approved" } });
+      if (JSON.parse(String(init!.body)).collectToken !== r.collectToken) return reply(403, { error: { code: "collect_token_invalid", message: "wrong agent" } });
       r.status = "collected";
       const si = r.approval!;
       const out = await service.create({ merchantId: si.intent.merchantId, amount: si.intent.amount, currency: si.intent.currency }, { userId: "platform", payKeyId: "k" }, { signedIntent: si, requireCustomerSignature: true });
@@ -341,4 +343,26 @@ test("approval kit: an agent's request says the agent asked, quotes its note as 
   assert.match(sneaky.warnings[1]!, /"payevil now"/, "direction overrides and zero-width characters are removed");
   await assert.rejects(approveAgentRequest({ intent: { ...intent, mandateId: "mandate-0123456789ab" }, payee: { name: "x", verified: true }, agentName: "a", keyId: "phone", confirm: async () => true, sign: async () => new Uint8Array() }));
   assert.equal(await approveAgentRequest({ intent, payee: { name: "x", verified: true }, agentName: "a", keyId: "phone", confirm: async () => false, sign: async () => new Uint8Array() }), null);
+});
+
+test("red-team pass 3, #7: another agent that learns a request id can't collect its card; the model never sees the collect secret", async () => {
+  const w = world();
+  w.setRule();
+  const mine = w.agent();
+  const req = await mine.requestApproval({ merchantId: "coffee-co", amount: 3_500, currency: "USD" });
+  assert.ok(req.ok);
+  await w.personApproves(req.requestId);
+  // A second process for the same person and key (or a hijacked one) that learned the id.
+  const other = w.agent();
+  const stolen = await other.checkApproval(req.requestId);
+  assert.ok(stolen.status === "error" && stolen.code === "not_this_agents_request", JSON.stringify(stolen));
+  assert.equal(w.requests.get(req.requestId)!.status, "approved", "still there for the agent that asked");
+  const got = await mine.checkApproval(req.requestId);
+  assert.equal(got.status, "approved");
+
+  // Over MCP, the secret never reaches the model.
+  const handle = createSpinMcpHandler(w.agent());
+  const asked = (await handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "spin_request_approval", arguments: { merchantId: "coffee-co", amount: "30.00", currency: "USD" } } })) as any;
+  const token = w.requests.get(asked.result.structuredContent.requestId)!.collectToken;
+  assert.ok(!JSON.stringify(asked).includes(token));
 });
