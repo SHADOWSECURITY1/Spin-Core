@@ -9,6 +9,10 @@ logic, used by SPIN, SPIN-Envelope and SPIN-Vault, instead of a copy in each.
   post-quantum messaging and forward-secret messaging, one implementation for
   web, Node and React Native.
   `import … from "@spin/core/vault"`.
+- **Envelope for Data** (v0.15): make a stolen database worthless. Each
+  sensitive value sealed with its own key; reads released one record at a
+  time, signed by the reader's device, inside signed read limits.
+  `import … from "@spin/core/data"`.
 
 ## What's in v0.1
 
@@ -154,6 +158,31 @@ stay in the server process and KMS. Configure with `SPIN_BASE_URL`,
            "SPIN_PAYER_ID": "payer_...", "SPIN_AGENT_KEY_ID": "agent-1",
            "SPIN_AWS_KMS_KEY_ID": "arn:aws:kms:..." } } } }
 ```
+
+## Envelope for Data (`@spin/core/data`, 0.15)
+
+Makes a stolen database worthless. `DataKeyService.seal()` encrypts each
+value with its own key (AES-256-GCM, bound to its collection and row) and
+stores that key only wrapped by a `DataKeyring` key the database never holds
+(KMS/HSM via `remoteDataKeyring`). A database copy, backup, open port or SQL
+injection returns ciphertext.
+
+`release()` unwraps one record's key for one read, and only if:
+
+- the reader's enrolled device signed the request (Ed25519, P-256, or a
+  passkey with user verification), fresh and never replayed;
+- a **read mandate**, signed by a configured authority (never the reader),
+  pins that exact device key and covers the collection and purpose;
+- the mandate's hourly and daily read budgets have room;
+- the record isn't a **decoy**: touching one freezes the reader and calls
+  `onAlert`.
+
+Every decision is audited with a trace id. Readers open records with
+`openRecord()` (portable, no Node APIs). `test/data-breach.test.ts` steals
+the database, then the app server, then a doctor's unlocked phone driven by
+an extraction agent: the first two read nothing, the third reads at most one
+hour's budget and stops at the first decoy. Limits and design:
+`docs/design/data-envelope.md`.
 
 ## Approval kit (`@spin/core/approval`)
 
