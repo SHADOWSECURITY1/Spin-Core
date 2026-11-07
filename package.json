@@ -1,6 +1,6 @@
 {
   "name": "@spin/core",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "description": "Shared SPIN security core: the Pay Envelope, and SPIN Vault's zero-knowledge file and post-quantum messaging crypto.",
   "private": true,
   "license": "BUSL-1.1",
@@ -30,6 +30,11 @@
       "types": "./dist/agent/index.d.ts",
       "import": "./dist/agent/index.js",
       "default": "./dist/agent/index.js"
+    },
+    "./data": {
+      "types": "./dist/data/index.d.ts",
+      "import": "./dist/data/index.js",
+      "default": "./dist/data/index.js"
     },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
